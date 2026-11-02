@@ -18,6 +18,7 @@
 #include "GaussianSplatTypeIds.h"
 #include <AzCore/Asset/AssetCommon.h>
 #include <AzCore/Asset/AssetSerializer.h>
+#include <AzCore/Math/Aabb.h>
 #include <AzFramework/Asset/GenericAssetHandler.h>
 
 namespace GaussianSplat
@@ -76,6 +77,8 @@ namespace GaussianSplat
         //! pass resolves to. The DC term itself stays at full precision in CloudVertex::m_shDc.
         AZStd::vector<uint16_t> m_shRest;
         uint32_t m_shDegree = 0; //!< SH degree (0-3) actually populated across m_data
+        //! Local-space bounds of every splat center in m_data.
+        AZ::Aabb m_bounds = AZ::Aabb::CreateNull();
 
         //! "Rest" coefficients this asset stores per splat: the stride of m_shRest, and zero at degree 0.
         //! Out of line because it is Math::ShRestCoeffsPerSplat, which this gem keeps private to Source.

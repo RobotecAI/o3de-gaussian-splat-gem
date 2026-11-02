@@ -27,6 +27,7 @@
 #include <AzCore/Math/Vector2.h>
 #include <AzCore/Settings/SettingsRegistry.h>
 #include <AzCore/std/algorithm.h>
+#include <AzCore/std/limits.h>
 #include <AzCore/std/string/string_view.h>
 #include <Utils/GaussianSplatPacking.h>
 #include <cstdint>
@@ -109,15 +110,14 @@ namespace GaussianSplat
             return TileGrid::TryGetPipelineFrameSize(pipeline).value_or(AZ::Vector2(1920.0f, 1080.0f));
         }
 
-        //! Uploads splatVertices, packed by Packing::PackCloudGeometry, into renderData's SplatGeometry buffer.
-        void UploadCloudGeometry(
-            GaussianSplatFeatureProcessor::CloudRenderData& renderData, const AZStd::vector<GaussianSplatAsset::CloudVertex>& splatVertices)
+        //! Uploads asset's splats, packed by Packing::PackCloudGeometry, into buffer.
+        void UploadCloudGeometry(AZ::Data::Instance<AZ::RPI::Buffer>& buffer, const GaussianSplatAsset& asset)
         {
-            const AZStd::vector<float> packed = Packing::PackCloudGeometry(splatVertices, renderData.m_splatCount);
+            const AZStd::vector<float> packed = Packing::PackCloudGeometry(asset.m_data);
 
             const auto byteCount = static_cast<uint32_t>(packed.size() * sizeof(float));
             if (!EnsureBuffer(
-                    renderData.m_sourceGeometry,
+                    buffer,
                     "GaussianSplatFeatureProcessor, SourceGeometry",
                     AZ::RPI::CommonBufferPoolType::ReadOnly,
                     Packing::GeometryElementSize,
@@ -125,19 +125,17 @@ namespace GaussianSplat
             {
                 return;
             }
-            renderData.m_sourceGeometry->UpdateData(packed.data(), byteCount);
+            buffer->UpdateData(packed.data(), byteCount);
         }
 
-        //! Uploads asset's SH coefficients, packed by Packing::PackCloudSh at uploadDegree, into renderData's
-        //! SH buffer, and advances its m_shDegree to match.
-        void UploadCloudSh(
-            GaussianSplatFeatureProcessor::CloudRenderData& renderData, const GaussianSplatAsset& asset, uint32_t uploadDegree)
+        //! Uploads asset's SH coefficients, packed by Packing::PackCloudSh at uploadDegree, into buffer.
+        void UploadCloudSh(AZ::Data::Instance<AZ::RPI::Buffer>& buffer, const GaussianSplatAsset& asset, uint32_t uploadDegree)
         {
-            const AZStd::vector<uint32_t> packed = Packing::PackCloudSh(asset, renderData.m_splatCount, uploadDegree);
+            const AZStd::vector<uint32_t> packed = Packing::PackCloudSh(asset, uploadDegree);
 
             const auto byteCount = static_cast<uint32_t>(packed.size() * sizeof(uint32_t));
             if (!EnsureBuffer(
-                    renderData.m_sourceSh,
+                    buffer,
                     "GaussianSplatFeatureProcessor, SourceSh",
                     AZ::RPI::CommonBufferPoolType::ReadOnly,
                     sizeof(uint32_t),
@@ -145,9 +143,7 @@ namespace GaussianSplat
             {
                 return;
             }
-            renderData.m_sourceSh->UpdateData(packed.data(), byteCount);
-            // Advanced only here, so GetCloudRenderData can never report a degree the buffer does not hold.
-            renderData.m_shDegree = uploadDegree;
+            buffer->UpdateData(packed.data(), byteCount);
         }
 
     } // namespace
@@ -245,10 +241,8 @@ namespace GaussianSplat
             RemoveSharedPasses(data);
         }
         m_pipelineData.clear();
-        for (const auto& [assetId, _] : m_gaussianSplatAssets)
-        {
-            AZ::Data::AssetBus::MultiHandler::BusDisconnect(assetId);
-        }
+        AZ::Data::AssetBus::MultiHandler::BusDisconnect();
+        m_gaussianSplatAssets.clear();
     }
 
     AZStd::vector<GaussianSplatFeatureProcessorInterface::GaussianSplatHandle> GaussianSplatFeatureProcessor::GetCloudHandles() const
@@ -555,84 +549,134 @@ namespace GaussianSplat
     GaussianSplatFeatureProcessorInterface::GaussianSplatHandle GaussianSplatFeatureProcessor::AcquireGaussianSplatFromAsset(
         AZ::Data::Asset<GaussianSplatAsset> gaussianSplatAsset)
     {
-        m_currentGaussianSplatDataIndex++;
-        auto& cloudData = m_splatCloudData[m_currentGaussianSplatDataIndex];
-        cloudData.m_index = m_currentGaussianSplatDataIndex;
+        const GaussianSplatHandle handle = ++m_currentGaussianSplatDataIndex;
+        const AZ::Data::AssetId assetId = gaussianSplatAsset.GetId();
+        auto& cloudData = m_splatCloudData[handle];
+        cloudData.m_index = handle;
+        cloudData.m_assetId = assetId;
         m_cloudSweepPending = true;
         MarkCloudPassesDirty();
-        m_gaussianSplatAssets[gaussianSplatAsset.GetId()] = m_currentGaussianSplatDataIndex;
-        cloudData.m_assetId = gaussianSplatAsset.GetId();
-        // Connecting also delivers OnAssetReady for an asset that is already Ready (AZ::Data::AssetBus's
-        // connection policy), and one still in ReadyPreNotify gets the queued notification once connected.
-        AZ::Data::AssetBus::MultiHandler::BusConnect(gaussianSplatAsset.GetId());
-        if (!(gaussianSplatAsset.IsLoading() || gaussianSplatAsset.IsReady()))
+
+        auto& assetData = m_gaussianSplatAssets[assetId];
+        assetData.m_handles.emplace_back(handle);
+        if (assetData.m_handles.size() == 1)
         {
-            gaussianSplatAsset.QueueLoad();
+            if (!(gaussianSplatAsset.IsLoading() || gaussianSplatAsset.IsReady()))
+            {
+                gaussianSplatAsset.QueueLoad();
+            }
+            assetData.m_asset = gaussianSplatAsset;
+            // Connecting also delivers OnAssetReady for an asset that is already Ready (AZ::Data::AssetBus's
+            // connection policy), and one still in ReadyPreNotify gets the queued notification once connected.
+            // Either replaces m_asset with the asset manager's current data, which the caller's copy may not
+            // be if the asset was reloaded since. A later cloud of the same asset just shares the entry.
+            AZ::Data::AssetBus::MultiHandler::BusConnect(assetId);
         }
+
         for (auto& [pipeline, data] : m_pipelineData)
         {
             InjectSharedPasses(pipeline, data);
         }
-        return m_currentGaussianSplatDataIndex;
+        return handle;
     }
 
     void GaussianSplatFeatureProcessor::UpdateCloudSourceBuffers()
     {
         m_cloudSweepPending = false;
 
-        uint32_t totalCount = 0;
-        for (const auto& [_, cloudData] : m_splatCloudData)
+        AZ::u64 totalCount = 0;
+        for (auto& [_, assetData] : m_gaussianSplatAssets)
         {
-            totalCount += cloudData.m_renderData.m_splatCount;
-        }
-        m_totalSplatCount = totalCount;
+            const auto* asset = assetData.m_asset.GetAs<GaussianSplatAsset>();
+            const bool loaded = asset != nullptr && asset->IsReady();
+            const auto splatCount = loaded ? static_cast<uint32_t>(asset->m_data.size()) : 0u;
+            totalCount += AZ::u64{ splatCount } * assetData.m_handles.size();
 
-        for (auto& [_, cloudData] : m_splatCloudData)
-        {
-            const auto* asset = cloudData.m_assetData.GetAs<GaussianSplatAsset>();
-            if (asset == nullptr || !asset->IsReady() || !cloudData.m_visible)
+            // The SH degree each cloud renders at, in m_handles order; nullopt for a cloud that renders nothing.
+            // Release keeps m_handles in step with m_splatCloudData, so every handle here names a cloud.
+            AZStd::vector<AZStd::optional<uint32_t>> renderedShDegrees(assetData.m_handles.size());
+            bool geometryNeeded = false;
+            AZStd::array<bool, GaussianSplatAsset::MaxShDegree + 1> shDegreeNeeded{};
+            for (size_t i = 0; i < assetData.m_handles.size(); ++i)
             {
-                continue;
+                const auto& cloudData = m_splatCloudData.at(assetData.m_handles[i]);
+                auto& degree = renderedShDegrees[i];
+                if (loaded && cloudData.m_visible)
+                {
+                    // The loader rejects assets above MaxShDegree, so this indexes shDegreeNeeded in bounds.
+                    degree = AZStd::min(asset->m_shDegree, cloudData.m_maxShDegreeOverride);
+                    geometryNeeded = true;
+                    shDegreeNeeded[*degree] = true;
+                }
             }
 
-            if (cloudData.m_renderData.m_sourceGeometry == nullptr)
+            if (!geometryNeeded)
             {
-                UploadCloudGeometry(cloudData.m_renderData, asset->m_data);
+                assetData.m_sourceGeometry = nullptr;
             }
-            uint32_t expectedShDegree = AZStd::min(asset->m_shDegree, cloudData.m_maxShDegreeOverride);
-            // The null check matters on its own: a cloud whose SH buffer was dropped at the same degree it
-            // already held would otherwise never get it back.
-            if (cloudData.m_renderData.m_sourceSh == nullptr || cloudData.m_renderData.m_shDegree != expectedShDegree)
+            else if (assetData.m_sourceGeometry == nullptr)
             {
-                UploadCloudSh(cloudData.m_renderData, *asset, expectedShDegree);
+                UploadCloudGeometry(assetData.m_sourceGeometry, *asset);
+            }
+            for (uint32_t degree = 0; degree < shDegreeNeeded.size(); ++degree)
+            {
+                if (!shDegreeNeeded[degree])
+                {
+                    assetData.m_sourceSh[degree] = nullptr;
+                }
+                else if (assetData.m_sourceSh[degree] == nullptr)
+                {
+                    UploadCloudSh(assetData.m_sourceSh[degree], *asset, degree);
+                }
+            }
+
+            // A failed upload leaves its buffer null, which FindRenderableCloud treats as not renderable.
+            for (size_t i = 0; i < assetData.m_handles.size(); ++i)
+            {
+                auto& renderData = m_splatCloudData.at(assetData.m_handles[i]).m_renderData;
+                renderData.m_splatCount = splatCount;
+                const auto degree = renderedShDegrees[i];
+                renderData.m_sourceGeometry = degree ? assetData.m_sourceGeometry : nullptr;
+                renderData.m_sourceSh = degree ? assetData.m_sourceSh[*degree] : nullptr;
+                renderData.m_shDegree = degree.value_or(0);
             }
         }
+
+        // The shared splat buffers and the shaders index splats with 32-bit counters, so that is as far as the
+        // capacity can go; the projection buffer allocation at that size will fail and be reported by
+        // EnsureBuffer rather than silently come out too small.
+        constexpr AZ::u64 MaxTotalSplatCount = AZStd::numeric_limits<uint32_t>::max();
+        AZ_Warning(
+            "GaussianSplatFeatureProcessor",
+            totalCount <= MaxTotalSplatCount,
+            "Total splat count across all clouds (%llu) exceeds %llu; clamping.",
+            static_cast<unsigned long long>(totalCount),
+            static_cast<unsigned long long>(MaxTotalSplatCount));
+        m_totalSplatCount = static_cast<uint32_t>(AZStd::min(totalCount, MaxTotalSplatCount));
     }
 
     void GaussianSplatFeatureProcessor::OnAssetReloaded(AZ::Data::Asset<AZ::Data::AssetData> asset)
     {
         if (auto it = m_gaussianSplatAssets.find(asset.GetId()); it != m_gaussianSplatAssets.end())
         {
-            const auto handle = it->second;
-            auto& cloudData = m_splatCloudData[handle];
-            auto* newAssetData = asset.GetAs<GaussianSplatAsset>();
-            AZ_Assert(newAssetData, "Asset is not of the expected type.");
-            // Holding the asset both keeps a ref count on it and keeps its m_data alive as this cloud's only
-            // copy of the vertices, which UpdateCloudSourceBuffers uploads from on a later frame.
-            cloudData.m_assetData = asset;
-            cloudData.m_renderData.m_splatCount = static_cast<uint32_t>(newAssetData->m_data.size());
-
-            AZ::Aabb aabb = AZ::Aabb::CreateNull();
-            for (const auto& vertex : newAssetData->m_data)
-            {
-                aabb.AddPoint(AZ::Vector3(vertex.m_position[0], vertex.m_position[1], vertex.m_position[2]));
-            }
-            cloudData.m_bounds = aabb;
-
-            cloudData.m_renderData.m_sourceGeometry = nullptr;
-            cloudData.m_renderData.m_sourceSh = nullptr;
+            auto& assetData = it->second;
+            AZ_Assert(asset.GetAs<GaussianSplatAsset>(), "Asset is not of the expected type.");
+            assetData.m_asset = asset;
+            // Repacked from the new data on the next sweep, which also repoints every cloud at the new buffers.
+            assetData.m_sourceGeometry = nullptr;
+            assetData.m_sourceSh = {};
             m_cloudSweepPending = true;
-            cloudData.m_changedEvent.Signal();
+
+            // From a copy of the handles: a change handler runs component code that may release or acquire
+            // clouds, which edits both maps under us.
+            const AZStd::vector<GaussianSplatHandle> handles = assetData.m_handles;
+            for (const auto handle : handles)
+            {
+                if (auto cloudIt = m_splatCloudData.find(handle); cloudIt != m_splatCloudData.end())
+                {
+                    cloudIt->second.m_changedEvent.Signal();
+                }
+            }
         }
     }
 
@@ -746,16 +790,7 @@ namespace GaussianSplat
         }
 
         it->second.m_visible = visible;
-        if (!visible)
-        {
-            // Dropped rather than left idle: m_assetData still holds the source, so the sweep repacks and
-            // re-uploads both buffers when the cloud is shown again.
-            it->second.m_renderData.m_sourceGeometry = nullptr;
-            it->second.m_renderData.m_sourceSh = nullptr;
-        }
         m_cloudSweepPending = true;
-        // The cull pass for this cloud has to go (or come back) with it: its SRG holds the only other
-        // reference to the source buffers, so a surviving pass would keep them allocated.
         MarkCloudPassesDirty();
     }
 
@@ -763,9 +798,10 @@ namespace GaussianSplat
     {
         if (auto it = m_splatCloudData.find(handle); it != m_splatCloudData.end())
         {
+            const AZ::Data::AssetId assetId = it->second.m_assetId;
             m_splatCloudData.erase(it);
-            // Each remaining cloud keeps its own source buffer untouched; only the total splat count (and
-            // therefore the shared output buffers' capacity) and the set of cull passes change.
+            // The remaining clouds keep their source buffers; the total splat count (and therefore the shared
+            // output buffers' capacity), the set of cull passes, and which SH degrees the asset still needs change.
             m_cloudSweepPending = true;
             MarkCloudPassesDirty();
             if (m_splatCloudData.empty())
@@ -775,15 +811,17 @@ namespace GaussianSplat
                     RemoveSharedPasses(data);
                 }
             }
-        }
 
-        for (auto it = m_gaussianSplatAssets.begin(); it != m_gaussianSplatAssets.end(); ++it)
-        {
-            if (it->second == handle)
+            // The asset's other clouds still need its data and reloads, so only its last user lets it go.
+            if (auto assetIt = m_gaussianSplatAssets.find(assetId); assetIt != m_gaussianSplatAssets.end())
             {
-                AZ::Data::AssetBus::MultiHandler::BusDisconnect(it->first);
-                m_gaussianSplatAssets.erase(it);
-                break;
+                auto& handles = assetIt->second.m_handles;
+                AZStd::erase(handles, handle);
+                if (handles.empty())
+                {
+                    AZ::Data::AssetBus::MultiHandler::BusDisconnect(assetId);
+                    m_gaussianSplatAssets.erase(assetIt);
+                }
             }
         }
     }
@@ -792,7 +830,9 @@ namespace GaussianSplat
     {
         if (auto it = m_splatCloudData.find(handle); it != m_splatCloudData.end())
         {
-            return it->second.m_renderData.m_splatCount;
+            // From the asset rather than m_renderData, which the sweep only updates on the next Simulate.
+            const auto* asset = FindLoadedAsset(it->second);
+            return asset ? static_cast<uint32_t>(asset->m_data.size()) : 0;
         }
         return 0;
     }
@@ -801,9 +841,21 @@ namespace GaussianSplat
     {
         if (auto it = m_splatCloudData.find(handle); it != m_splatCloudData.end())
         {
-            return it->second.m_bounds;
+            const auto* asset = FindLoadedAsset(it->second);
+            return asset ? asset->m_bounds : AZ::Aabb::CreateNull();
         }
         return AZStd::nullopt;
+    }
+
+    const GaussianSplatAsset* GaussianSplatFeatureProcessor::FindLoadedAsset(const SplatCloudData& cloudData) const
+    {
+        const auto it = m_gaussianSplatAssets.find(cloudData.m_assetId);
+        if (it == m_gaussianSplatAssets.end())
+        {
+            return nullptr;
+        }
+        const auto* asset = it->second.m_asset.GetAs<GaussianSplatAsset>();
+        return asset != nullptr && asset->IsReady() ? asset : nullptr;
     }
 
     void GaussianSplatFeatureProcessor::ConnectChangeEventHandler(
