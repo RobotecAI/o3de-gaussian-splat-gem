@@ -238,6 +238,8 @@ if(PAL_TRAIT_BUILD_TESTS_SUPPORTED)
             ly_add_target(
                 NAME ${gem_name}.Editor.Tests ${PAL_TRAIT_TEST_TARGET_TYPE}
                 NAMESPACE Gem
+                PLATFORM_INCLUDE_FILES
+                    ${CMAKE_CURRENT_LIST_DIR}/Platform/Common/${PAL_TRAIT_COMPILER_ID}/gaussiansplat_editor_${PAL_TRAIT_COMPILER_ID_LOWERCASE}.cmake
                 FILES_CMAKE
                     gaussiansplat_editor_tests_files.cmake
                 INCLUDE_DIRECTORIES
