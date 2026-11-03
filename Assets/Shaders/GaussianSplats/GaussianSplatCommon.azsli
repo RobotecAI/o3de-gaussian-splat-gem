@@ -1,0 +1,105 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// Bits consumed per digit round, and the resulting number of rounds and digit values. 
+// The sort covers the key's low 48 bits only for efficiency - see PackRadixKey.
+#define RadixDigitBits 8
+#define NumDigits 256
+#define NumRadixRounds 6
+
+// Shared types/helpers for the GPU tile-binning/radix-sort/tile-shading pass chain.
+
+// Entries each thread of a 256-thread radix-sort group owns, and the resulting block size. Every stage that
+// walks the entries in blocks (GlobalHistogram, Onesweep) uses these, so they stay
+// consistent with GaussianSplatFeatureProcessor.cpp's RadixBlockSize and with
+// GaussianSplatRadixPrepareSortDispatch.azsl's block count.
+//
+// More than one key per thread is what makes Onesweep's decoupled look-back pay for itself: all of its
+// bookkeeping - the per-round status-buffer clear, the two status publishes, the look-back chain length - is
+// per block, not per entry, so raising this divides all of it by RadixKeysPerThread. At one key per thread the
+// look-back cost exceeded the cost of moving the entries themselves. The ceiling is register pressure: each
+// thread holds its entries in registers from the initial read until after the look-back (see
+// GaussianSplatRadixOnesweep.azsl), 3 registers per entry.
+#define RadixKeysPerThread 16
+#define RadixBlockSize (NumDigits * RadixKeysPerThread)
+
+
+// Screen-space tile size in pixels, on both axes. Must stay in sync with TileGrid::TileSizePixels in
+// GaussianSplatTileGrid.h, which sizes the tile grid the CPU allocates SplatBuffers::m_tileRanges for and
+// every tile-indexed pass's tile counts come from.
+static const uint TileSizePixels = 16;
+
+// GPU-written per-visible-splat screen-space data, one entry per splat surviving culling. Every visible cloud
+// merges into one flat array.
+struct SplatProjection2D
+{
+    float2 m_pixelCenter;
+    // Inverse 2D covariance (conic), pixel^-2 units: (a, b, c) such that a Gaussian falloff at pixel offset
+    // (dx, dy) from m_pixelCenter is exp(-0.5*(a*dx*dx + c*dy*dy) - b*dx*dy)
+    float3 m_conic;
+    float m_opacity;
+    float m_deviceDepth; // reverse-Z NDC depth, for the per-pixel opaque occlusion test
+    float3 m_color; // View-dependent already evaluated SH color.
+};
+
+// Per-tile (offset, count) range into the flat, GPU-radix-sorted splat-index buffer, 
+// sorted near-to-far within each tile. 
+struct TileRange
+{
+    uint m_offset;
+    uint m_count;
+};
+
+// Opacity below which a splat is considered visually negligible - the per-splat screen-space extent is
+// sized so the Gaussian's falloff reaches this value exactly at the extent's edge 
+// (AdR-Gaussian's adaptive radius, SIGGRAPH Asia 2024). 
+// 1/255 is one 8-bit alpha step, the standard invisible threshold under 8-bit alpha blending.
+static const float AlphaLowThreshold = 1.0 / 255.0;
+
+
+// One (sort key, payload) pair the GPU radix-sort pass chain operates on - one entry per (splat, touched-tile)
+// pair. 12 bytes, matching RadixEntrySize in GaussianSplatFeatureProcessor::EnsurePipelineBuffers. See
+// PackRadixKey for the key's bit layout.
+struct RadixEntry
+{
+    // m_key.x = near-to-far quantized depth (least-significant word, sorted first), m_key.y = tileId
+    // (most-significant word, sorted last). See PackRadixKey.
+    uint2 m_key;
+    uint m_visibleSlot;
+};
+
+// Packs tileId and a near-to-far quantized deviceDepth into one ascending-sortable 64-bit key (as two uint32
+// words), so one radix sort produces both per-tile grouping and within-tile depth order in a single pass chain.
+uint2 PackRadixKey(uint tileId, float deviceDepth)
+{
+    // Reverse-Z: larger deviceDepth is nearer to the camera. Inverting it makes ascending key order =
+    // near-to-far, matching the tile-shading pass's front-to-back compositing order.
+    const uint depth32 = 0xFFFFFFFFu - (uint)round(saturate(deviceDepth) * 4294967295.0);
+    return uint2(depth32, tileId);
+}
+
+uint UnpackTileIdFromRadixKey(uint2 key)
+{
+    return key.y;
+}
+
+// Extracts this round's 8-bit digit, given digitShift in [0, 40] 
+// 0/8/16/24 = depth word's bytes, 32/40 = the tileId word's low two bytes
+uint ExtractRadixDigit(uint2 key, uint digitShift)
+{
+    return (key[digitShift / 32] >> (digitShift % 32)) & 0xFF;
+}

@@ -1,0 +1,83 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+
+// Tallies every digit round's 256-bin global histogram in one pass over the entries, before any round runs.
+// One 256-thread group per RadixBlockSize-sized block, indirectly dispatched off the same DispatchArgs the
+// rounds use. 
+//
+// Doing this once for every round is what lets each round be a single fused kernel
+// (GaussianSplatRadixOnesweep.azsl): that kernel needs its round's per-digit base offset up front, and
+// deriving it per round would force a separate full pass over the entries before each round's scan.
+//
+// The shortcut is that sorting only permutes the entries, so the multiset of keys - and therefore the count of
+// each digit value at each byte position - is identical no matter how many rounds have already run. Every
+// round's histogram is computable here, from the unsorted input.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<RadixEntry> m_entries;
+    StructuredBuffer<uint> m_counts; // [0] = entryCount (GaussianSplatRadixPrepareSortDispatch.azsl)
+    // [round * NumDigits + d] = running total of digit value d at round `round`'s byte position, across every
+    // entry. Consumed by the GaussianSplatRadixDigitBase pass to derive each round's per-digit base offsets.
+    RWStructuredBuffer<uint> m_globalHistogramOut;
+}
+
+// This block's own [round][digit] tally, 8 KB. Folded into m_globalHistogramOut once at the end, so the
+// per-entry traffic stays in groupshared memory.
+groupshared uint s_localHistogram[NumRadixRounds * NumDigits];
+
+[numthreads(NumDigits, 1, 1)]
+void MainCS(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    // Thread d clears bin d of all NumRadixRounds rows.
+    for (uint clearRound = 0; clearRound < NumRadixRounds; ++clearRound)
+    {
+        s_localHistogram[clearRound * NumDigits + groupIndex] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Same block decomposition as GaussianSplatRadixOnesweep.azsl - RadixKeysPerThread entries per thread,
+    // each step's 256 threads covering one contiguous run so the reads stay coalesced. Order is irrelevant
+    // here (this only tallies), but sharing the decomposition is what lets both passes run off the one
+    // indirect block count.
+    [unroll]
+    for (uint keyStep = 0; keyStep < RadixKeysPerThread; ++keyStep)
+    {
+        const uint globalIndex = groupId.x * RadixBlockSize + keyStep * NumDigits + groupIndex;
+        if (globalIndex < PassSrg::m_counts[0])
+        {
+            // One read of the key serves every round.
+            const uint2 key = PassSrg::m_entries[globalIndex].m_key;
+            for (uint tallyRound = 0; tallyRound < NumRadixRounds; ++tallyRound)
+            {
+                const uint digit = ExtractRadixDigit(key, tallyRound * RadixDigitBits);
+                InterlockedAdd(s_localHistogram[tallyRound * NumDigits + digit], 1);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint foldRound = 0; foldRound < NumRadixRounds; ++foldRound)
+    {
+        const uint binCount = s_localHistogram[foldRound * NumDigits + groupIndex];
+        // Do not perform a global atomic write when not needed.
+        if (binCount != 0)
+        {
+            InterlockedAdd(PassSrg::m_globalHistogramOut[foldRound * NumDigits + groupIndex], binCount);
+        }
+    }
+}

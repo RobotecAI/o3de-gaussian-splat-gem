@@ -1,0 +1,73 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+
+// One thread group per digit round (SV_GroupID.x selects the round), dispatched directly - this pass's cost
+// and output never depend on this frame's entry/block count. Runs once per frame, between
+// GaussianSplatRadixGlobalHistogramPass and the first round, turning each round's finished 256-bin global
+// histogram row into that round's per-digit exclusive prefix base: the total count of every digit value below
+// it, across every entry.
+//
+// GaussianSplatRadixOnesweep.azsl needs that base to turn its per-block look-back result into an absolute
+// output offset, and it is identical for every block in the round. Computing it here - once, in a single small
+// dispatch - lets every thread group in every round just read the result.
+//
+// Uses SM6.0 wave intrinsics (WavePrefixSum/WaveGetLaneIndex/WaveGetLaneCount) with no non-wave fallback -
+// requires RHI::DeviceFeatures::m_waveOperation, guaranteed here by the .shader file's Vulkan 1.1 target.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<uint> m_globalHistogram;
+    RWStructuredBuffer<uint> m_digitBaseOut;
+}
+
+// Max simultaneous waves in a 256-thread group, assuming a minimum hardware subgroup size of 32. Mirrors
+// GaussianSplatRadixOnesweep.azsl's define of the same name.
+#define MaxWavesPerGroup (NumDigits / 32)
+
+// Per-wave totals, the cross-wave half of the row-wide scan below.
+groupshared uint s_waveTotals[MaxWavesPerGroup];
+
+[numthreads(NumDigits, 1, 1)]
+void MainCS(uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    const uint rowBase = groupId.x * NumDigits;
+    const uint d = groupIndex;
+    const uint digitTotal = PassSrg::m_globalHistogram[rowBase + d];
+
+    // Exclusive scan of the row's NumDigits bins: one wave-level prefix sum plus a walk over at most
+    // MaxWavesPerGroup wave totals, rather than a log2(NumDigits)-step groupshared scan. Same shape as the
+    // per-block digit scan in GaussianSplatRadixOnesweep.azsl. WavePrefixSum is already exclusive, so unlike
+    // an inclusive scan this needs no final subtraction of the digit's own total.
+    const uint laneCount = WaveGetLaneCount();
+    const uint waveId = groupIndex / laneCount;
+    const uint lane = WaveGetLaneIndex();
+
+    const uint waveExclusive = WavePrefixSum(digitTotal);
+    if (lane == laneCount - 1)
+    {
+        s_waveTotals[waveId] = waveExclusive + digitTotal;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint waveCarry = 0;
+    for (uint priorWave = 0; priorWave < waveId; ++priorWave)
+    {
+        waveCarry += s_waveTotals[priorWave];
+    }
+
+    PassSrg::m_digitBaseOut[rowBase + d] = waveCarry + waveExclusive;
+}

@@ -1,0 +1,123 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatTileShadingPassTemplate",
+            "PassClass": "GaussianSplatTileShadingPass",
+            "Slots": [
+                {
+                    "Name": "OpaqueDepth",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader",
+                    "ImageViewDesc": {
+                        "AspectFlags": [
+                            "Depth"
+                        ]
+                    }
+                },
+                {
+                    "Name": "Accumulation",
+                    "SlotType": "Output",
+                    "ScopeAttachmentUsage": "Shader",
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Value": [
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0
+                            ]
+                        }
+                    }
+                },
+                {
+                    "Name": "SplatDepth",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_splatDepth",
+                    "ScopeAttachmentUsage": "Shader",
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Value": [
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0
+                            ]
+                        }
+                    }
+                },
+                {
+                    "Name": "TileSplatIndices",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_tileSplatIndices",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "TileRanges",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_tileRanges",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "SplatProjection",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_splatProjection",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "ImageAttachments": [
+                {
+                    "Name": "AccumulationImage",
+                    "SizeSource": {
+                        "Source": {
+                            "Pass": "This",
+                            "Attachment": "OpaqueDepth"
+                        }
+                    },
+                    "ImageDescriptor": {
+                        "Format": "R16G16B16A16_FLOAT"
+                    }
+                },
+                {
+                    "Name": "SplatDepthImage",
+                    "SizeSource": {
+                        "Source": {
+                            "Pass": "This",
+                            "Attachment": "OpaqueDepth"
+                        }
+                    },
+                    "ImageDescriptor": {
+                        "Format": "R32_FLOAT"
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "Accumulation",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "AccumulationImage"
+                    }
+                },
+                {
+                    "LocalSlot": "SplatDepth",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "SplatDepthImage"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatTileShading.shader"
+                },
+                "FullscreenDispatch": true
+            }
+        }
+    }
+}

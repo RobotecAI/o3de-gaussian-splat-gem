@@ -1,0 +1,85 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixBuildKeysPassTemplate",
+            "PassClass": "GaussianSplatRadixBuildKeysPass",
+            "Slots": [
+                {
+                    "Name": "EntriesOut",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_entriesOut",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    // "Vector4Uint" is required: Vulkan bit-casts the first component into vkCmdFillBuffer.
+                    "Name": "EntryCounter",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_entryCounter",
+                    "ScopeAttachmentUsage": "Shader",
+                    "LoadStoreAction": {
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [ 0, 0, 0, 0 ]
+                        },
+                        "LoadAction": "Clear"
+                    }
+                },
+                {
+                    "Name": "SplatProjection",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_splatProjection",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "VisibleCounter",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_visibleCounter",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "IndirectArgs",
+                    "SlotType": "Input",
+                    "ShaderInputName": "NoBind",
+                    "ScopeAttachmentUsage": "Indirect"
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    // Fixed size and single-frame, so it needs none of GaussianSplatFeatureProcessor's
+                    // capacity-driven allocation. Structured view, matching RWStructuredBuffer<uint>.
+                    "Name": "EntryCounter",
+                    "Lifetime": "Transient",
+                    "BufferDescriptor": {
+                        "m_bindFlags": "ShaderReadWrite",
+                        "m_byteCount": "4"
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementCount": "1",
+                        "m_elementSize": "4"
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "EntryCounter",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "EntryCounter"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixBuildKeys.shader"
+                },
+                "FullscreenDispatch": false,
+                "IndirectDispatch": true,
+                "IndirectDispatchBufferSlotName": "IndirectArgs"
+            }
+        }
+    }
+}

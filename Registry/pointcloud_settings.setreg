@@ -1,0 +1,13 @@
+{
+  "O3DE": {
+    "Pointcloud": {
+      "Builder": {
+        // Required to correctly process .ply files: Gaussian splat .ply files have no red/green/blue
+        // vertex properties, so this makes the Pointcloud Gem builder skip them and leave them to
+        // the GaussianSplat builder.
+        // See https://github.com/RobotecAI/robotec-o3de-tools/pull/191
+        "SkipPlyWithoutColor": true
+      }
+    }
+  }
+}

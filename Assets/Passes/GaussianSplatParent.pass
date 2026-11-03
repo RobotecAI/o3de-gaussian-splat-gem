@@ -1,0 +1,359 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatParentTemplate",
+            "PassClass": "ParentPass",
+            "Slots": [
+                {
+                    "Name": "OpaqueDepth",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader",
+                    "ImageViewDesc": {
+                        "AspectFlags": [
+                            "Depth"
+                        ]
+                    }
+                },
+                {
+                    "Name": "ColorInputOutput",
+                    "SlotType": "InputOutput",
+                    "ScopeAttachmentUsage": "RenderTarget"
+                },
+                // The pipeline's linear (view-distance) depth buffer, which GaussianSplatDepthComposite merges
+                // the splats' own depth into. Also exposed so a consumer that needs the merged result can
+                // address it on this pass rather than on DepthPrePass, whose copy is only the opaque depth.
+                {
+                    "Name": "DepthLinearInputOutput",
+                    "SlotType": "InputOutput",
+                    "ScopeAttachmentUsage": "RenderTarget"
+                }
+            ],
+            "PassRequests": [
+                {
+                    "Name": "GaussianSplatProjectCullGroup",
+                    "TemplateName": "GaussianSplatProjectCullGroupPassTemplate"
+                },
+                {
+                    "Name": "GaussianSplatRadixPrepareBuildKeysDispatch",
+                    "TemplateName": "GaussianSplatRadixPrepareBuildKeysDispatchPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "VisibleCounter",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatProjectCullGroup",
+                                "Attachment": "VisibleCounterOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixBuildKeys",
+                    "TemplateName": "GaussianSplatRadixBuildKeysPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "SplatProjection",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatProjectCullGroup",
+                                "Attachment": "SplatProjectionOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "VisibleCounter",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatProjectCullGroup",
+                                "Attachment": "VisibleCounterOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareBuildKeysDispatch",
+                                "Attachment": "DispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixPrepareSortDispatch",
+                    "TemplateName": "GaussianSplatRadixPrepareSortDispatchPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "EntryCounter",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixBuildKeys",
+                                "Attachment": "EntryCounter"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixGlobalHistogram",
+                    "TemplateName": "GaussianSplatRadixGlobalHistogramPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "Entries",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixBuildKeys",
+                                "Attachment": "EntriesOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "Counts",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "CountsOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixDigitBase",
+                    "TemplateName": "GaussianSplatRadixDigitBasePassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "GlobalHistogram",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixGlobalHistogram",
+                                "Attachment": "GlobalHistogramOut"
+                            }
+                        }
+                    ]
+                },
+                // The six LSD radix-sort digit rounds, one dispatch each, over digit shifts 0/8/16/24/32/40.
+                // Each instance takes its round index from its own name and binds its own
+                // GaussianSplatFeatureProcessor-owned buffers; only transient attachments are wired here.
+                {
+                    "Name": "GaussianSplatRadixOnesweep0",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixOnesweep1",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixOnesweep2",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixOnesweep3",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixOnesweep4",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixOnesweep5",
+                    "TemplateName": "GaussianSplatRadixOnesweepPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DigitBase",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixDigitBase",
+                                "Attachment": "DigitBaseOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "BlockDispatchArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatRadixUnpack",
+                    "TemplateName": "GaussianSplatRadixUnpackPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "SortedEntries",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixOnesweep5",
+                                "Attachment": "EntriesOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "Counts",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "CountsOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "IndirectArgs",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixPrepareSortDispatch",
+                                "Attachment": "UnpackArgsOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatTileShading",
+                    "TemplateName": "GaussianSplatTileShadingPassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "OpaqueDepth",
+                            "AttachmentRef": {
+                                "Pass": "Parent",
+                                "Attachment": "OpaqueDepth"
+                            }
+                        },
+                        {
+                            "LocalSlot": "TileSplatIndices",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixUnpack",
+                                "Attachment": "TileSplatIndicesOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "TileRanges",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatRadixUnpack",
+                                "Attachment": "TileRangesOut"
+                            }
+                        },
+                        {
+                            "LocalSlot": "SplatProjection",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatProjectCullGroup",
+                                "Attachment": "SplatProjectionOut"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatComposite",
+                    "TemplateName": "GaussianSplatCompositePassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "ColorInputOutput",
+                            "AttachmentRef": {
+                                "Pass": "Parent",
+                                "Attachment": "ColorInputOutput"
+                            }
+                        },
+                        {
+                            "LocalSlot": "AccumulationInput",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatTileShading",
+                                "Attachment": "Accumulation"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "Name": "GaussianSplatDepthComposite",
+                    "TemplateName": "GaussianSplatDepthCompositePassTemplate",
+                    "Connections": [
+                        {
+                            "LocalSlot": "DepthLinearInputOutput",
+                            "AttachmentRef": {
+                                "Pass": "Parent",
+                                "Attachment": "DepthLinearInputOutput"
+                            }
+                        },
+                        {
+                            "LocalSlot": "SplatDepthInput",
+                            "AttachmentRef": {
+                                "Pass": "GaussianSplatTileShading",
+                                "Attachment": "SplatDepth"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}

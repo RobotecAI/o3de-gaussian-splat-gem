@@ -1,0 +1,62 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <viewsrg_all.srgi>
+#include <Atom/Features/PostProcessing/FullscreenVertexUtil.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexInfo.azsli>
+
+// Merges GaussianSplatTileShading.azsl's per-pixel splat depth into the pipeline's linear depth buffer
+// (DepthPrePass's DepthLinear), the depth-side counterpart of GaussianSplatComposite.azsl. The merge itself is
+// the render target's Minimum blend op - the nearer of the splat and the opaque surface wins per pixel - so
+// this shader only has to linearize and to kill the fragments the splats never covered.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    // Reverse-Z NDC depth of the nearest visible splat, 0 where no splat settled the pixel.
+    Texture2D<float> m_splatDepth;
+}
+
+struct PSOutput
+{
+    float m_linearDepth : SV_Target0;
+};
+
+VSOutput MainVS(VSInput input)
+{
+    VSOutput OUT;
+    float4 posTex = GetVertexPositionAndTexCoords(input.m_vertexID);
+    OUT.m_position = float4(posTex.x, posTex.y, 0.0, 1.0);
+    OUT.m_texCoord = posTex.zw;
+    return OUT;
+}
+
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+
+    const uint2 screenCoords = uint2(IN.m_position.xy);
+    const float deviceDepth = PassSrg::m_splatDepth.Load(uint3(screenCoords, 0)).r;
+    if (deviceDepth == 0.0)
+    {
+        discard;
+        return OUT;
+    }
+
+    // The same reverse-Z-to-view-distance conversion the engine's own DepthToLinearDepth.azsl applies to the
+    // depth buffer this result is blended into, so the two sides of the min are in the same units.
+    OUT.m_linearDepth =
+        abs((ViewSrg::GetFarZTimesNearZ()) / (ViewSrg::GetFarZMinusNearZ() * deviceDepth - ViewSrg::GetFarZ()));
+    return OUT;
+}

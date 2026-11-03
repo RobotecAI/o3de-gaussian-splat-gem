@@ -1,0 +1,109 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+
+// Uses SM6.0 wave intrinsics with no non-wave fallback - requires RHI::DeviceFeatures::m_waveOperation,
+// guaranteed by the .shader file's Vulkan 1.1 target.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<SplatProjection2D> m_splatProjection;
+    StructuredBuffer<uint> m_visibleCounter;
+    RWStructuredBuffer<uint> m_entryCounter;
+    RWStructuredBuffer<RadixEntry> m_entriesOut;
+
+    uint m_tileCountX;
+    uint m_tileCountY;
+    uint m_entryCapacity;
+    // Capacity of m_splatProjection as allocated. m_visibleCounter can run past it (ProjectCull reserves
+    // slots before its own bounds check), so slots are bounded by both.
+    uint m_visibleCapacity;
+}
+
+// Inclusive tile-index bounding box (minTx, minTy, maxTx, maxTy) of a splat's screen-space extent, clamped to
+// the tile grid. GaussianSplatRadixBuildKeys.azsl expands this into one entry per touched tile.
+uint4 TileTouchRangeFor(float2 pixelCenter, float2 extentPixels, uint tileCountX, uint tileCountY)
+{
+    const uint lastTx = tileCountX > 0 ? tileCountX - 1 : 0;
+    const uint lastTy = tileCountY > 0 ? tileCountY - 1 : 0;
+    return uint4(
+        min((uint)(max(0.0, pixelCenter.x - extentPixels.x) / TileSizePixels), lastTx),
+        min((uint)(max(0.0, pixelCenter.y - extentPixels.y) / TileSizePixels), lastTy),
+        min((uint)(max(0.0, pixelCenter.x + extentPixels.x) / TileSizePixels), lastTx),
+        min((uint)(max(0.0, pixelCenter.y + extentPixels.y) / TileSizePixels), lastTy));
+}
+
+// Recovers a splat's per-axis screen-space half-extent, in pixels, from the conic and opacity stored in its SplatProjection2D.
+//
+// The conic (a, b, c) is the inverse of the projected 2D covariance [covA covB; covB covC], so
+// det(conic) = a*c - b*b = 1/det(cov), giving covA = c/det(conic) and covC = a/det(conic) with no need to
+// carry the covariance itself. The extent along each axis is then sqrt(cutoffFactor * cov_ii), independent
+// of the off-diagonal term.
+float2 ExtentPixelsFromProjection(SplatProjection2D proj)
+{
+    const float conicDet = proj.m_conic.x * proj.m_conic.z - proj.m_conic.y * proj.m_conic.y;
+    if (conicDet <= 0.0)
+    {
+        return float2(0.0, 0.0);
+    }
+
+    const float covA = proj.m_conic.z / conicDet;
+    const float covC = proj.m_conic.x / conicDet;
+    // m_opacity is stored already multiplied by the cloud's opacity multiplier but unclamped; saturate to
+    // match the effective opacity ProjectSplatToScreen sized the extent with.
+    const float cutoffFactor = 2.0 * max(0.0, log(max(saturate(proj.m_opacity), 1e-6) / AlphaLowThreshold));
+    return float2(sqrt(cutoffFactor * covA), sqrt(cutoffFactor * covC));
+}
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 dispatchId : SV_DispatchThreadID)
+{
+    const uint visibleSlot = dispatchId.x;
+    if (visibleSlot >= min(PassSrg::m_visibleCounter[0], PassSrg::m_visibleCapacity))
+    {
+        return;
+    }
+
+    const SplatProjection2D proj = PassSrg::m_splatProjection[visibleSlot];
+    const uint4 range = TileTouchRangeFor(
+        proj.m_pixelCenter, ExtentPixelsFromProjection(proj), PassSrg::m_tileCountX, PassSrg::m_tileCountY);
+    const float deviceDepth = proj.m_deviceDepth;
+    const uint touchCount = (range.z - range.x + 1) * (range.w - range.y + 1);
+
+    // Wave intrinsics used to minimize atomic contention on global variable. 
+    const uint waveTouchTotal = WaveActiveSum(touchCount);
+    const uint laneTouchOffset = WavePrefixSum(touchCount);
+
+    uint waveBaseIndex = 0;
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(PassSrg::m_entryCounter[0], waveTouchTotal, waveBaseIndex);
+    }
+    uint writeIndex = WaveReadLaneFirst(waveBaseIndex) + laneTouchOffset;
+
+    RadixEntry entry;
+    entry.m_visibleSlot = visibleSlot;
+    for (uint ty = range.y; ty <= range.w; ++ty)
+    {
+        for (uint tx = range.x; tx <= range.z && writeIndex < PassSrg::m_entryCapacity; ++tx)
+        {
+            const uint tileId = ty * PassSrg::m_tileCountX + tx;
+            entry.m_key = PackRadixKey(tileId, deviceDepth);
+            PassSrg::m_entriesOut[writeIndex] = entry;
+            ++writeIndex;
+        }
+    }
+}

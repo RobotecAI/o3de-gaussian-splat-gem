@@ -1,0 +1,18 @@
+{
+    "Amazon": {
+        "AssetProcessor": {
+            "Settings": {
+                "ScanFolder GaussianSplat/Assets": {
+                    "watch": "@GEMROOT:GaussianSplat@/Assets",
+                    "recursive": 1,
+                    "order": 101
+                },
+                "ScanFolder GaussianSplat/Registry": {
+                    "watch": "@GEMROOT:GaussianSplat@/Registry",
+                    "recursive": 1,
+                    "order": 102
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,95 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "GaussianSplatCommon.azsli"
+
+// SM6.0 wave-intrinsic helpers for the radix sort's in-block ranking. Deliberately kept out of
+// GaussianSplatCommon.azsli, which every splat shader includes: only shaders whose .shader file targets Vulkan
+// 1.1 (and so guarantees RHI::DeviceFeatures::m_waveOperation) may pull these in.
+
+// Number of set bits in a WaveActiveBallot-shaped mask.
+uint CountBits4(uint4 mask)
+{
+    return countbits(mask.x) + countbits(mask.y) + countbits(mask.z) + countbits(mask.w);
+}
+
+// Bits for the lanes strictly below `lane` within the 32-lane group starting at lane `base`: all-ones when
+// `lane` is at or past the end of that group, all-zeroes when it is at or before the start.
+uint LanesBelowInWord(uint lane, uint base)
+{
+    // Clamped so the shift below stays in [0, 31]; shifting a uint by 32 is undefined.
+    const uint bits = (uint)clamp((int)lane - (int)base, 0, 32);
+    return (bits >= 32u) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+}
+
+// Mask of the lanes strictly below `index`, in WaveActiveBallot's uint4 bit layout. `index` need not be a
+// real lane - LanesBelowInWord saturates, so NoLane gives an all-ones mask and FirstSetLane's miss value can
+// be passed straight through.
+uint4 LanesBelowIndex(uint index)
+{
+    return uint4(
+        LanesBelowInWord(index, 0u),
+        LanesBelowInWord(index, 32u),
+        LanesBelowInWord(index, 64u),
+        LanesBelowInWord(index, 96u));
+}
+
+// Mask of the lanes strictly below this one - the HLSL equivalent of CUDA's %lanemask_lt. Used with
+// CountBits4 to turn a ballot into a "how many matching lanes precede me" rank.
+uint4 LanesBelowSelf()
+{
+    return LanesBelowIndex(WaveGetLaneIndex());
+}
+
+// FirstSetLane's "no bit set" result: one past the highest lane a ballot mask can address, so
+// LanesBelowIndex(NoLane) is all-ones and it compares above any real lane at either wave width.
+static const uint NoLane = 128u;
+
+// Index of the lowest set bit in a WaveActiveBallot-shaped mask, or NoLane when it is empty.
+uint FirstSetLane(uint4 mask)
+{
+    [unroll]
+    for (uint word = 0; word < 4; ++word)
+    {
+        if (mask[word] != 0u)
+        {
+            return word * 32u + firstbitlow(mask[word]);
+        }
+    }
+    return NoLane;
+}
+
+// Wave-wide mask of the lanes whose `digit` equals this lane's, considering only lanes where `valid` is true.
+// Narrows a candidate mask one digit bit at a time - the manual equivalent of SM6.5's WaveMatch, since only
+// SM6.0 ballot/lane intrinsics are assumed available.
+//
+// `valid` gates the seed ballot only. The narrowing loop can never set a bit that the seed cleared, so an
+// invalid lane's bit stays zero in every other lane's mask without the per-bit AND that would otherwise be
+// paid RadixDigitBits times per call. An invalid lane's own returned mask is meaningless, since the digit it
+// narrowed by came from an entry it does not own - callers must discard it.
+uint4 WaveMatchDigit(uint digit, bool valid)
+{
+    uint4 mask = WaveActiveBallot(valid);
+    [unroll]
+    for (uint bit = 0; bit < RadixDigitBits; ++bit)
+    {
+        const bool bitSet = ((digit >> bit) & 1u) != 0u;
+        const uint4 ballot = WaveActiveBallot(bitSet);
+        mask &= bitSet ? ballot : ~ballot;
+    }
+    return mask;
+}

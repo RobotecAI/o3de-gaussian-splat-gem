@@ -1,0 +1,159 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+
+// Tile-based compute rasterizer: one 16x16 thread group per screen tile, over the GPU-built tile->splat-index
+// buffer and per-tile ranges (GaussianSplatRadixUnpackPass). Each batch is cooperatively loaded into
+// group-shared memory, then in-bounds pixels composite front-to-back with a transmittance accumulator,
+// terminating early once saturated. See Docs/Rasterizer.md's "Drawing" section.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<SplatProjection2D> m_splatProjection;
+    StructuredBuffer<uint> m_tileSplatIndices;
+    StructuredBuffer<TileRange> m_tileRanges;
+    Texture2D<float> m_opaqueDepth;
+    RWTexture2D<float4> m_accumulation;
+    // Reverse-Z NDC depth of the nearest visible splat per pixel, 0 (the reverse-Z far plane) where no splat
+    // reaches m_depthCoverageThreshold. GaussianSplatDepthComposite.azsl linearizes this and merges it into
+    // the pipeline's DepthLinear.
+    RWTexture2D<float> m_splatDepth;
+
+    // Sent as float2 (exact for any realistic tile-grid size), not uint2 - see
+    // GaussianSplatTileShadingPass::CompileResources. The model matrix and SH degree are per-splat fields on
+    // SplatProjection2D rather than per-pass constants, since one pass instance is shared by every visible cloud.
+    float2 m_tileCount;
+    // Accumulated coverage (1 - transmittance) at which a pixel's depth is taken to be settled.
+    float m_depthCoverageThreshold;
+}
+
+// Thread-group size (one thread per pixel in a 16x16 tile) and the matching splat-batch size (one splat loaded
+// per thread per batch iteration) for the group-shared cooperative load below.
+static const uint BatchSize = 256;
+
+groupshared float2 s_pixelCenter[BatchSize];
+groupshared float3 s_conic[BatchSize];
+groupshared float4 s_colorAlpha[BatchSize]; // rgb = shaded color, a = opacity
+groupshared float s_deviceDepth[BatchSize];
+
+groupshared uint s_finishedCount;
+
+[numthreads(16, 16, 1)]
+void MainCS(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint2 groupId : SV_GroupID)
+{
+    const uint2 pixelCoord = dispatchId.xy;
+    uint outWidth, outHeight;
+    PassSrg::m_accumulation.GetDimensions(outWidth, outHeight);
+    const bool pixelInBounds = pixelCoord.x < outWidth && pixelCoord.y < outHeight;
+
+    // The dispatch follows the live frame size, m_tileCount the size the buffers were allocated for; the two
+    // differ between a resize and the buffer rebuild after it. A group outside the grid has no range slot, so
+    // it composites nothing. The test is uniform per group, so all its threads skip the batch loop and its
+    // barriers together.
+    const uint2 tileCount = uint2(PassSrg::m_tileCount);
+    const bool tileInGrid = groupId.x < tileCount.x && groupId.y < tileCount.y;
+    const uint tileId = groupId.y * tileCount.x + groupId.x;
+    TileRange range = (TileRange)0;
+    if (tileInGrid)
+    {
+        range = PassSrg::m_tileRanges[tileId];
+    }
+    const uint rangeEnd = range.m_offset + min(range.m_count, 65536);
+
+    float3 accumColor = float3(0.0, 0.0, 0.0);
+    float transmittance = pixelInBounds ? 1.0 : 0.0;
+    // Reverse-Z, so 0 doubles as the far plane and as "no splat has settled this pixel's depth yet".
+    float splatDeviceDepth = 0.0;
+    const float sceneDepth = pixelInBounds ? PassSrg::m_opaqueDepth.Load(uint3(pixelCoord, 0)).r : 0.0;
+
+    bool finishedYet = false;
+    bool occluded = false;
+    if (groupIndex == 0)
+    {
+        s_finishedCount = 0;
+    }
+
+    for (uint batchStart = range.m_offset; batchStart < rangeEnd; batchStart += BatchSize)
+    {
+        // Cooperative load: every thread loads exactly one entry (if any remain in this batch), regardless of
+        // whether its own pixel is in bounds or already saturated - all threads must stay live through the
+        // GroupMemoryBarrierWithGroupSync() below.
+        const uint loadIndex = batchStart + groupIndex;
+        if (loadIndex < rangeEnd)
+        {
+            const uint visibleSlot = PassSrg::m_tileSplatIndices[loadIndex];
+            const SplatProjection2D proj = PassSrg::m_splatProjection[visibleSlot];
+            s_pixelCenter[groupIndex] = proj.m_pixelCenter;
+            s_conic[groupIndex] = proj.m_conic;
+            s_colorAlpha[groupIndex] = float4(proj.m_color, proj.m_opacity);
+            s_deviceDepth[groupIndex] = proj.m_deviceDepth;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        const uint batchCount = min(BatchSize, rangeEnd - batchStart);
+        for (uint j = 0; j < batchCount && !occluded && transmittance > (1.0 / 255.0); ++j)
+        {
+            // Reverse-Z opaque occlusion test: a splat renders only where it is nearer than or equal to
+            // the opaque depth already at this pixel. Batches are sorted strictly near-to-far (PackRadixKey),
+            // so once one splat is behind the opaque surface, every later splat in the range is farther still
+            // and also occluded - flag the pixel so it skips the remainder of the tile's range entirely,
+            // while keeping the transmittance (and therefore the output alpha) it had reached so far.
+            if (s_deviceDepth[j] < sceneDepth)
+            {
+                occluded = true;
+                break;
+            }
+
+            const float2 d = float2(pixelCoord) + 0.5 - s_pixelCenter[j];
+            const float3 conic = s_conic[j];
+            const float power = -0.5 * (conic.x * d.x * d.x + conic.z * d.y * d.y) - conic.y * d.x * d.y;
+
+            const float alpha = min(0.99, s_colorAlpha[j].a * exp(power));
+            if (alpha < (1.0 / 255.0))
+            {
+                continue;
+            }
+
+            accumColor += transmittance * alpha * s_colorAlpha[j].rgb;
+            transmittance *= (1.0 - alpha);
+
+            // Latch the depth of the splat that pushed coverage over the threshold. The range is sorted
+            // strictly near-to-far, so the first splat to do so is the nearest one the threshold considers
+            // visible, and every later splat leaves the latch alone.
+            if (splatDeviceDepth == 0.0 && (1.0 - transmittance) >= PassSrg::m_depthCoverageThreshold)
+            {
+                splatDeviceDepth = s_deviceDepth[j];
+            }
+        }
+        if (!finishedYet && (occluded || transmittance <= (1.0 / 255.0)))
+        {
+            finishedYet = true;
+            InterlockedAdd(s_finishedCount, 1);
+        }
+        GroupMemoryBarrierWithGroupSync(); // before the next batch overwrites shared memory
+
+        if (s_finishedCount == BatchSize)
+        {
+            break;
+        }
+    }
+
+    if (pixelInBounds)
+    {
+        PassSrg::m_accumulation[pixelCoord] = float4(accumColor, 1.0 - transmittance);
+        PassSrg::m_splatDepth[pixelCoord] = splatDeviceDepth;
+    }
+}

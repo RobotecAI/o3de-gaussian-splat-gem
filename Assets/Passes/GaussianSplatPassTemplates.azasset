@@ -1,0 +1,65 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "AssetAliasesSourceData",
+    "ClassData": {
+        "AssetPaths": [
+            {
+                "Name": "GaussianSplatVisibleCounterClearPassTemplate",
+                "Path": "Passes/GaussianSplatVisibleCounterClear.pass"
+            },
+            {
+                "Name": "GaussianSplatProjectCullPassTemplate",
+                "Path": "Passes/GaussianSplatProjectCull.pass"
+            },
+            {
+                "Name": "GaussianSplatProjectCullGroupPassTemplate",
+                "Path": "Passes/GaussianSplatProjectCullGroup.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixPrepareBuildKeysDispatchPassTemplate",
+                "Path": "Passes/GaussianSplatRadixPrepareBuildKeysDispatch.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixBuildKeysPassTemplate",
+                "Path": "Passes/GaussianSplatRadixBuildKeys.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixPrepareSortDispatchPassTemplate",
+                "Path": "Passes/GaussianSplatRadixPrepareSortDispatch.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixGlobalHistogramPassTemplate",
+                "Path": "Passes/GaussianSplatRadixGlobalHistogram.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixDigitBasePassTemplate",
+                "Path": "Passes/GaussianSplatRadixDigitBase.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixOnesweepPassTemplate",
+                "Path": "Passes/GaussianSplatRadixOnesweep.pass"
+            },
+            {
+                "Name": "GaussianSplatRadixUnpackPassTemplate",
+                "Path": "Passes/GaussianSplatRadixUnpack.pass"
+            },
+            {
+                "Name": "GaussianSplatTileShadingPassTemplate",
+                "Path": "Passes/GaussianSplatTileShading.pass"
+            },
+            {
+                "Name": "GaussianSplatCompositePassTemplate",
+                "Path": "Passes/GaussianSplatComposite.pass"
+            },
+            {
+                "Name": "GaussianSplatDepthCompositePassTemplate",
+                "Path": "Passes/GaussianSplatDepthComposite.pass"
+            },
+            {
+                "Name": "GaussianSplatParentTemplate",
+                "Path": "Passes/GaussianSplatParent.pass"
+            }
+        ]
+    }
+}

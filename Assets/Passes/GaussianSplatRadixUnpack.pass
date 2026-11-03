@@ -1,0 +1,62 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixUnpackPassTemplate",
+            "PassClass": "GaussianSplatRadixUnpackPass",
+            "Slots": [
+                {
+                    "Name": "SortedEntries",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_sortedEntries",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "TileSplatIndicesOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_tileSplatIndicesOut",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "TileRangesOut",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_tileRangesOut",
+                    "ScopeAttachmentUsage": "Shader",
+                    // The RHI zeroes every tile's (offset, count) before the dispatch, so tiles with no entries
+                    // this frame read back (0, 0) instead of a stale range, and the shader's InterlockedAdd on
+                    // m_count accumulates from zero. Note: the RHI's Metal backend has no buffer-clear path.
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [0, 0, 0, 0]
+                        }
+                    }
+                },
+                {
+                    "Name": "Counts",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_counts",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "IndirectArgs",
+                    "SlotType": "Input",
+                    "ShaderInputName": "NoBind",
+                    "ScopeAttachmentUsage": "Indirect"
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixUnpack.shader"
+                },
+                "FullscreenDispatch": false,
+                "IndirectDispatch": true,
+                "IndirectDispatchBufferSlotName": "IndirectArgs"
+            }
+        }
+    }
+}

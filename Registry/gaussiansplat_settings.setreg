@@ -1,0 +1,8 @@
+{
+    "Robotec": {
+        "GaussianSplat": {
+            "RadixEntryCapacity": 16777216,
+            "DepthCoverageThreshold": 0.02
+        }
+    }
+}

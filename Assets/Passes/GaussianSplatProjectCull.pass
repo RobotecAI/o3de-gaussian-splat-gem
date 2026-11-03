@@ -1,0 +1,33 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatProjectCullPassTemplate",
+            "PassClass": "GaussianSplatProjectCullPass",
+            "Slots": [
+                {
+                    "Name": "VisibleCounter",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_visibleCounter",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "SplatProjectionOut",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_splatProjectionOut",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatProjectCull.shader"
+                },
+                "FullscreenDispatch": false,
+                "BindViewSrg": true
+            }
+        }
+    }
+}

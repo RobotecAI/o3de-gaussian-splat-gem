@@ -1,0 +1,382 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <viewsrg_all.srgi>
+#include "GaussianSplatCommon.azsli"
+
+// Per-splat geometry, read as one 48-byte structured-buffer element by GaussianSplatProjectCull.azsl and
+// passed straight to ProjectSplatToScreen. Spherical-harmonics coefficients deliberately live in a separate
+// buffer. Fields are ordered so each float3 is followed by exactly one scalar, filling the remaining
+// 4 bytes of that 16-byte register with no explicit padding rules to get wrong.
+struct SplatGeometry
+{
+    float3 m_position;
+    float m_opacity;
+    float4 m_rotation; // normalized quaternion (x, y, z, w)
+    float3 m_scale;
+    float _padding0;
+};
+
+// One thread per splat of one cloud computes each splat's screen-space projection and
+// SH color once per splat per frame, so GaussianSplatTileShading.azsl reads the precomputed color instead of
+// recomputing it per tile touched. Surviving splats reserve a visible-slot on the counter shared with every
+// other cloud's cull pass - one wave-aggregated InterlockedAdd per wave rather than one per splat - consumed
+// by GaussianSplatRadixBuildKeysPass and GaussianSplatTileShadingPass.
+//
+// Uses SM6.0 wave intrinsics (WaveActiveCountBits/WavePrefixCountBits/WaveIsFirstLane/WaveReadLaneFirst)
+// with no non-wave fallback - requires the Vulkan 1.1 target its .shader file already sets, and so
+// RHI::DeviceFeatures::m_waveOperation.
+//
+// Geometry and spherical harmonics are two separate buffers rather than one interleaved record. Every thread
+// reads geometry, so keeping it in its own tightly packed buffer makes adjacent threads' reads contiguous;
+// only a thread whose splat survives culling ever reads SH, and it then reads nothing else, so the two never
+// share a cache line. The SH buffer is packed to the cloud's uploaded degree.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<SplatGeometry> m_sourceGeometry;
+    // Coefficient-major, RGB-interleaved binary16: each splat's run holds an (R, G, B) triple for the DC
+    // term, then one triple per "rest" coefficient, two coefficients to a uint. EvaluateShColor consumes
+    // exactly one such triple at a time, so this layout makes the whole evaluation a linear walk - unlike the
+    // asset's channel-major [R_0..R_(k-1), G_0..G_(k-1), B_0..B_(k-1)] storage, where a triple is k
+    // coefficients apart. GaussianSplatFeatureProcessor::UploadCloudSh does the transpose once, at upload.
+    StructuredBuffer<uint> m_sourceSh;
+    RWStructuredBuffer<uint> m_visibleCounter;
+    RWStructuredBuffer<SplatProjection2D> m_splatProjectionOut;
+
+    row_major float4x4 m_modelMatrix; // this cloud's model (local -> world) matrix
+    float2 m_viewportSize;
+    float m_opacityMultiplier;
+    float m_scaleMultiplier;
+    uint m_splatCount; // this cloud's splat count - this dispatch's thread count
+    // Stride into m_sourceSh, in uints, at the degree the buffer currently holds: 3 * (1 + "rest"
+    // coefficients per channel) binary16 values, two to a uint, rounded up to a whole uint. Always consistent
+    // with m_shDegree - both are derived from one value CPU-side, and both track the degree actually uploaded
+    // rather than a pending override, so evaluation can never run past what is stored.
+    uint m_shUintsPerSplat;
+    int m_shDegree;
+    // Capacity of the *shared* output buffers, sized to every registered cloud's splats together.
+    // Bounds the slot this cloud's splats may claim in buffers every cloud writes into.
+    uint m_visibleCapacity;
+}
+
+// Recovers the near-plane distance from a right-handed perspective view-to-clip matrix, or 0 if it isn't one.
+// ViewSrg::GetNearZ() is not a substitute: under an infinite far plane it returns a large, meaningless value,
+// causing spurious near-plane culling of every splat.
+float NearPlaneFromViewToClip(float4x4 viewToClip)
+{
+    if (abs(viewToClip[3][2] + 1.0) > 1e-4 || abs(viewToClip[3][3]) > 1e-4)
+    {
+        return 0.0;
+    }
+
+    const float m22 = viewToClip[2][2];
+    const float m23 = viewToClip[2][3];
+    const float nearDeviceDepth = (m23 > 0.0) ? 1.0 : 0.0;
+    const float denominator = nearDeviceDepth + m22;
+    if (abs(denominator) < 1e-6)
+    {
+        return 0.0;
+    }
+
+    const float nearPlane = m23 / denominator;
+    return max(nearPlane, 0.0);
+}
+
+// Small screen-space dilation so sub-pixel splats don't disappear/alias: the ~0.3px^2 low-pass filter
+// described in Kerbl et al. 2023, "3D Gaussian Splatting for Real-Time Radiance Field Rendering",
+// added directly in pixel^2 units.
+static const float PixelDilation = 0.3;
+
+// NDC-space margin past the screen edge a splat's center may sit in before it's culled, applied
+// before the covariance/Jacobian projection below. Bounds viewPosition.x/y relative to depth, so
+// the EWA Jacobian's affine approximation (only locally valid) is never evaluated on arbitrarily
+// off-axis splats. Matches vk_gaussian_splatting's frustumDilation default (shaders/shaderio.h).
+static const float FrustumDilationNdc = 0.2;
+
+// Screen-space projection of one splat, in pixel units (not NDC).
+struct SplatScreenProjection
+{
+    float2 m_pixelCenter;
+    float3 m_worldPosition;
+    // Inverse 2D covariance (conic), pixel^-2 units: (a, b, c) - see SplatProjection2D in GaussianSplatCommon.azsli.
+    float3 m_conic;
+    // Per-axis half-extent, pixels, out to where the Gaussian's falloff reaches AlphaLowThreshold. 
+    // Bounds the off-screen cull below.
+    float2 m_extentPixels;
+    float m_deviceDepth; // NDC depth (clip.z / clip.w)
+    bool m_valid;
+};
+
+// Converts a normalized quaternion (x, y, z, w) into a 3x3 rotation matrix, matching
+// AZ::Matrix3x3::CreateFromQuaternion's convention.
+float3x3 QuaternionToMatrix3x3(float4 q)
+{
+    const float x2 = q.x + q.x;
+    const float y2 = q.y + q.y;
+    const float z2 = q.z + q.z;
+    const float xx = q.x * x2, xy = q.x * y2, xz = q.x * z2;
+    const float yy = q.y * y2, yz = q.y * z2, zz = q.z * z2;
+    const float wx = q.w * x2, wy = q.w * y2, wz = q.w * z2;
+
+    return float3x3(
+        1.0 - (yy + zz), xy - wz, xz + wy,
+        xy + wz, 1.0 - (xx + zz), yz - wx,
+        xz - wy, yz + wx, 1.0 - (xx + yy));
+}
+
+// Upper-left 3x3 (rotation/scale) block of a 4x4 matrix, matching AZ::Matrix3x3::CreateFromMatrix4x4. m must be
+// row_major so m[row] is that row's float4 (m[row].xyz drops the translation/projection column).
+float3x3 UpperLeft3x3(float4x4 m)
+{
+    return float3x3(m[0].xyz, m[1].xyz, m[2].xyz);
+}
+
+// Projects one splat's Gaussian into pixel space: position, 2D covariance/conic, and an opacity-adaptive,
+// axis-aligned screen-space bounding extent (EWA splatting via the projection's local Jacobian). Reads this
+// cloud's transform and multipliers straight off PassSrg and the camera off ViewSrg rather than taking them
+// as arguments; like EvaluateShColor below, it addresses this pass's own SRG and has no other call site.
+SplatScreenProjection ProjectSplatToScreen(SplatGeometry splat)
+{
+    SplatScreenProjection result = (SplatScreenProjection)0;
+    const float nearPlaneDistance = NearPlaneFromViewToClip(ViewSrg::m_projectionMatrix);
+
+    const float3 scale = splat.m_scale * PassSrg::m_scaleMultiplier;
+
+    const float3 worldPosition = mul(PassSrg::m_modelMatrix, float4(splat.m_position, 1.0)).xyz;
+    result.m_worldPosition = worldPosition;
+    const float3 viewPosition = mul(ViewSrg::m_viewMatrix, float4(worldPosition, 1.0)).xyz;
+
+    // View space looks down the camera's local -Z, so positive view depth is -viewPosition.z.
+    const float viewDepth = -viewPosition.z;
+
+    // Splats nearer than the near plane are dropped whole rather than clipped: nothing downstream would
+    // otherwise reject them, since tile shading only depth-tests against the opaque buffer.
+    if (viewDepth < nearPlaneDistance)
+    {
+        result.m_valid = false;
+        return result;
+    }
+
+    const float4 clipPosition = mul(ViewSrg::m_projectionMatrix, float4(viewPosition, 1.0));
+    const float clipW = clipPosition.w;
+    if (clipW <= 1e-6)
+    {
+        result.m_valid = false;
+        return result;
+    }
+    const float ndcX = clipPosition.x / clipW;
+    const float ndcY = clipPosition.y / clipW;
+    result.m_deviceDepth = clipPosition.z / clipW;
+
+    // Reject splats whose center sits well outside the frustum before the covariance/Jacobian
+    // projection below, so that projection is never evaluated on arbitrarily off-axis splats -
+    // see FrustumDilationNdc.
+    if (abs(ndcX) > 1.0 + FrustumDilationNdc || abs(ndcY) > 1.0 + FrustumDilationNdc)
+    {
+        result.m_valid = false;
+        return result;
+    }
+
+    // NDC -> pixel space, flipping Y since NDC-Y grows upward but the accumulation image has row 0 at the top;
+    // the Jacobian's focalPixelY carries the same flip.
+    const float safeViewportX = max(PassSrg::m_viewportSize.x, 1.0);
+    const float safeViewportY = max(PassSrg::m_viewportSize.y, 1.0);
+    result.m_pixelCenter = float2((ndcX * 0.5 + 0.5) * safeViewportX, (1.0 - (ndcY * 0.5 + 0.5)) * safeViewportY);
+
+    // World-space covariance: Sigma = R*S*(R*S)^T.
+    const float3x3 modelRot3x3 = UpperLeft3x3(PassSrg::m_modelMatrix);
+    const float3x3 splatRot3x3 = QuaternionToMatrix3x3(splat.m_rotation);
+    const float3x3 R = mul(modelRot3x3, splatRot3x3);
+    const float3x3 S = float3x3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
+    const float3x3 RS = mul(R, S);
+    const float3x3 covWorld = mul(RS, transpose(RS));
+
+    // Jacobian of the perspective projection in pixel units: d(pixel)/d(view) = focal * (viewportSize/2) /
+    // viewDepth. focalPixelY carries the same Y-flip as the pixel center above, so the covariance and the
+    // center agree on which way pixel-Y points.
+    const float invZ = 1.0 / max(viewDepth, 1e-4);
+    const float invZ2 = invZ * invZ;
+    const float focalPixelX = ViewSrg::m_projectionMatrix[0][0] * safeViewportX * 0.5;
+    const float focalPixelY = -ViewSrg::m_projectionMatrix[1][1] * safeViewportY * 0.5;
+    const float3x3 jacobian = float3x3(
+        focalPixelX * invZ, 0.0, focalPixelX * viewPosition.x * invZ2,
+        0.0, focalPixelY * invZ, focalPixelY * viewPosition.y * invZ2,
+        0.0, 0.0, 0.0);
+
+    const float3x3 viewRot3x3 = UpperLeft3x3(ViewSrg::m_viewMatrix);
+    const float3x3 T = mul(jacobian, viewRot3x3);
+    const float3x3 covPixel = mul(T, mul(covWorld, transpose(T)));
+
+    const float covA = covPixel[0][0] + PixelDilation;
+    const float covB = covPixel[0][1];
+    const float covC = covPixel[1][1] + PixelDilation;
+
+    const float det = covA * covC - covB * covB;
+    if (det <= 0.0)
+    {
+        result.m_valid = false;
+        return result;
+    }
+
+    const float invDet = 1.0 / det;
+    result.m_conic = float3(covC * invDet, -covB * invDet, covA * invDet);
+
+    // Per-axis bounding extent out to where the Gaussian's falloff drops to AlphaLowThreshold (AdR-Gaussian's
+    // adaptive radius): for an ellipse x^T*Sigma^-1*x <= cutoffFactor, the axis-aligned extent along axis i
+    // is sqrt(cutoffFactor * Sigma_ii), independent of the off-diagonal correlation term - so covA/covC (the
+    // projected covariance's diagonal terms) are sufficient and no eigen-decomposition is needed.
+    const float effectiveOpacity = saturate(splat.m_opacity * PassSrg::m_opacityMultiplier);
+    const float cutoffFactor = 2.0 * max(0.0, log(max(effectiveOpacity, 1e-6) / AlphaLowThreshold));
+    result.m_extentPixels = float2(sqrt(cutoffFactor * covA), sqrt(cutoffFactor * covC));
+
+    // Cull splats whose bounding box doesn't intersect the viewport at all.
+    const bool onScreen = (result.m_pixelCenter.x + result.m_extentPixels.x >= 0.0) &&
+        (result.m_pixelCenter.x - result.m_extentPixels.x <= safeViewportX) &&
+        (result.m_pixelCenter.y + result.m_extentPixels.y >= 0.0) &&
+        (result.m_pixelCenter.y - result.m_extentPixels.y <= safeViewportY);
+
+    result.m_valid = onScreen;
+    return result;
+}
+
+// Real spherical-harmonics normalization constants (degree 0-3), 
+// from the closed-form evaluation of the real SH basis functions.
+static const float SH_C0 = 0.28209479177387814;
+static const float SH_C1 = 0.4886025119029199;
+static const float SH_C2_0 = 1.0925484305920792;
+static const float SH_C2_1 = -1.0925484305920792;
+static const float SH_C2_2 = 0.31539156525252005;
+static const float SH_C2_3 = -1.0925484305920792;
+static const float SH_C2_4 = 0.5462742152960396;
+static const float SH_C3_0 = -0.5900435899266435;
+static const float SH_C3_1 = 2.890611442640554;
+static const float SH_C3_2 = -0.4570457994644658;
+static const float SH_C3_3 = 0.3731763325901154;
+static const float SH_C3_4 = -0.4570457994644658;
+static const float SH_C3_5 = 1.445305721320277;
+static const float SH_C3_6 = -0.5900435899266435;
+
+// One binary16 coefficient out of a splat's run, counting halves from the run's start: two to a uint, low
+// half first - the layout GaussianSplatFeatureProcessor's WriteHalf packs.
+float ShHalf(uint shBase, uint halfIndex)
+{
+    const uint word = PassSrg::m_sourceSh[shBase + (halfIndex >> 1)];
+    return f16tof32((halfIndex & 1) ? (word >> 16) : word);
+}
+
+// This splat's SH element `element` as an (R, G, B) triple. Element 0 of the run is the DC term, so rest
+// coefficient i is element 1 + i.
+float3 ShElement(uint shBase, uint element)
+{
+    const uint halfIndex = element * 3;
+    return float3(ShHalf(shBase, halfIndex), ShHalf(shBase, halfIndex + 1), ShHalf(shBase, halfIndex + 2));
+}
+
+// This splat's "rest" coefficient `coeff` as an (R, G, B) triple.
+float3 ShRest(uint shBase, uint coeff)
+{
+    return ShElement(shBase, 1 + coeff);
+}
+
+// Evaluates the splat's view-dependent color from its spherical-harmonics coefficients, following the same
+// closed-form real-SH evaluation used by the reference 3D Gaussian Splatting method. Reads the coefficients
+// from m_sourceSh as it needs them: a degree-1 cloud never issues the degree-2/3 loads.
+float3 EvaluateShColor(uint shBase, float3 viewDir, int degree)
+{
+    float3 result = SH_C0 * ShElement(shBase, 0);
+    if (degree >= 1)
+    {
+        float x = viewDir.x;
+        float y = viewDir.y;
+        float z = viewDir.z;
+        result += SH_C1 * (-y * ShRest(shBase, 0) + z * ShRest(shBase, 1) - x * ShRest(shBase, 2));
+
+        if (degree >= 2)
+        {
+            float xx = x * x;
+            float yy = y * y;
+            float zz = z * z;
+            float xy = x * y;
+            float yz = y * z;
+            float xz = x * z;
+            result += SH_C2_0 * xy * ShRest(shBase, 3) + SH_C2_1 * yz * ShRest(shBase, 4) +
+                SH_C2_2 * (2.0 * zz - xx - yy) * ShRest(shBase, 5) + SH_C2_3 * xz * ShRest(shBase, 6) +
+                SH_C2_4 * (xx - yy) * ShRest(shBase, 7);
+
+            if (degree >= 3)
+            {
+                result += SH_C3_0 * y * (3.0 * xx - yy) * ShRest(shBase, 8) +
+                    SH_C3_1 * xy * z * ShRest(shBase, 9) +
+                    SH_C3_2 * y * (4.0 * zz - xx - yy) * ShRest(shBase, 10) +
+                    SH_C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * ShRest(shBase, 11) +
+                    SH_C3_4 * x * (4.0 * zz - xx - yy) * ShRest(shBase, 12) +
+                    SH_C3_5 * z * (xx - yy) * ShRest(shBase, 13) +
+                    SH_C3_6 * x * (xx - 3.0 * yy) * ShRest(shBase, 14);
+            }
+        }
+    }
+    // SH DC is trained relative to a 0.5-gray baseline, the convention of 3DGS-format .ply files
+    // (Kerbl et al. 2023).
+    return saturate(result + 0.5);
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 dispatchId : SV_DispatchThreadID)
+{
+    const uint splatIndex = dispatchId.x;
+    if (splatIndex >= PassSrg::m_splatCount)
+    {
+        return;
+    }
+
+    const SplatGeometry splat = PassSrg::m_sourceGeometry[splatIndex];
+
+    const SplatScreenProjection proj = ProjectSplatToScreen(splat);
+    if (!proj.m_valid)
+    {
+        return;
+    }
+
+    // SH coefficients are in the cloud's local frame, so rotate the view direction into it.
+    const float3 worldViewDir = proj.m_worldPosition - ViewSrg::m_worldPosition.xyz;
+    const float3 viewDir = normalize(mul(transpose(UpperLeft3x3(PassSrg::m_modelMatrix)), worldViewDir));
+
+    // Every lane still active at this point owns a splat that survived culling and needs exactly one slot,
+    // wave intrinsics used to minimize atomic contention on global m_visibleCounter.
+    const uint waveSurvivorCount = WaveActiveCountBits(true);
+    const uint laneSlotOffset = WavePrefixCountBits(true);
+
+    uint waveBaseSlot = 0;
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(PassSrg::m_visibleCounter[0], waveSurvivorCount, waveBaseSlot);
+    }
+    const uint visibleSlot = WaveReadLaneFirst(waveBaseSlot) + laneSlotOffset;
+
+    // Slots past the shared output buffers' fixed capacity m_visibleCapacity are dropped.
+    if (visibleSlot >= PassSrg::m_visibleCapacity)
+    {
+        return;
+    }
+
+    SplatProjection2D outProj;
+    outProj.m_pixelCenter = proj.m_pixelCenter;
+    outProj.m_conic = proj.m_conic;
+    outProj.m_opacity = splat.m_opacity * PassSrg::m_opacityMultiplier;
+    outProj.m_deviceDepth = proj.m_deviceDepth;
+    outProj.m_color = EvaluateShColor(splatIndex * PassSrg::m_shUintsPerSplat, viewDir, PassSrg::m_shDegree);
+    PassSrg::m_splatProjectionOut[visibleSlot] = outProj;
+}

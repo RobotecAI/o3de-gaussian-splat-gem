@@ -1,0 +1,33 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassRequest",
+    "ClassData": {
+        "Name": "GaussianSplatParent",
+        "TemplateName": "GaussianSplatParentTemplate",
+        "Enabled": true,
+        "Connections": [
+            {
+                "LocalSlot": "OpaqueDepth",
+                "AttachmentRef": {
+                    "Pass": "DepthPrePass",
+                    "Attachment": "Depth"
+                }
+            },
+            {
+                "LocalSlot": "DepthLinearInputOutput",
+                "AttachmentRef": {
+                    "Pass": "DepthPrePass",
+                    "Attachment": "DepthLinear"
+                }
+            },
+            {
+                "LocalSlot": "ColorInputOutput",
+                "AttachmentRef": {
+                    "Pass": "PostProcessPass",
+                    "Attachment": "Output"
+                }
+            }
+        ]
+    }
+}

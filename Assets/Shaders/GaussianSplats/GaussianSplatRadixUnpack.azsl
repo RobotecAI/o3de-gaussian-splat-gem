@@ -1,0 +1,84 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+#include "GaussianSplatWaveOps.azsli"
+
+// One thread per sorted entry (i < m_counts[0], the real per-frame entry count). Only writes tiles with
+// entries this frame; the tiles without any read back (0, 0).
+//
+// Uses SM6.0 wave intrinsics with no non-wave fallback - requires RHI::DeviceFeatures::m_waveOperation,
+// guaranteed by the .shader file's Vulkan 1.1 target.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<RadixEntry> m_sortedEntries;
+    StructuredBuffer<uint> m_counts; // [0] = entryCount (GaussianSplatRadixPrepareSortDispatch.azsl)
+    RWStructuredBuffer<uint> m_tileSplatIndicesOut;
+    RWStructuredBuffer<TileRange> m_tileRangesOut;
+
+    uint m_tileCount;
+}
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 dispatchId : SV_DispatchThreadID)
+{
+    const uint i = dispatchId.x;
+    if (i >= PassSrg::m_counts[0])
+    {
+        return;
+    }
+
+    const RadixEntry entry = PassSrg::m_sortedEntries[i];
+    PassSrg::m_tileSplatIndicesOut[i] = entry.m_visibleSlot;
+
+    const uint tileId = UnpackTileIdFromRadixKey(entry.m_key);
+    if (tileId >= PassSrg::m_tileCount)
+    {
+        return;
+    }
+
+    const bool isRunStart = (i == 0) ||
+        (UnpackTileIdFromRadixKey(PassSrg::m_sortedEntries[i - 1].m_key) != tileId);
+    if (isRunStart)
+    {
+        PassSrg::m_tileRangesOut[tileId].m_offset = i;
+    }
+
+    // Every entry in the run adds to its tile's count - order-independent, so no boundary/backward scan is
+    // needed to derive the run length. Aggregated per wave, since the entries are sorted and lanes hold
+    // consecutive ones: a tile's run is a run of adjacent lanes, so the isRunStart ballot splits the wave into
+    // segments and each segment's lowest lane adds its whole length with one atomic. Otherwise a wave inside
+    // one tile's run would issue 32-64 atomics on the same address and serialize.
+    //
+    // A segment's lowest lane is a run start, or - for a run that began in an earlier wave - the lowest lane
+    // still active. Every active lane falls in exactly one counted segment, so runs spanning waves or thread
+    // groups still total correctly.
+    // Both ballots have to be taken with the whole wave still converged, so they stay out of the branch
+    // below. The per-lane mask arithmetic does not, and only a segment leader needs it - typically one lane
+    // of the wave, since a wave whose entries all fall in one tile has a single segment.
+    const uint4 activeMask = WaveActiveBallot(true);
+    const uint4 runStartMask = WaveActiveBallot(isRunStart);
+    const bool isFirstActiveLane = WaveIsFirstLane();
+
+    if (isRunStart || isFirstActiveLane)
+    {
+        const uint lane = WaveGetLaneIndex();
+        const uint4 belowSelf = LanesBelowIndex(lane);
+        const uint nextRunStart = FirstSetLane(runStartMask & ~LanesBelowIndex(lane + 1));
+        const uint4 segment = activeMask & ~belowSelf & LanesBelowIndex(nextRunStart);
+        InterlockedAdd(PassSrg::m_tileRangesOut[tileId].m_count, CountBits4(segment));
+    }
+}

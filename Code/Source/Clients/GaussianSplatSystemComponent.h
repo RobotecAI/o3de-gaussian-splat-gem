@@ -1,0 +1,56 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <Atom/RPI.Public/Pass/PassSystemInterface.h>
+#include <AzCore/Component/Component.h>
+#include <AzCore/std/smart_ptr/unique_ptr.h>
+#include <GaussianSplat/GaussianSplatAsset.h>
+
+namespace GaussianSplat
+{
+    class GaussianSplatSystemComponent : public AZ::Component
+    {
+    public:
+        AZ_COMPONENT_DECL(GaussianSplatSystemComponent);
+
+        static void Reflect(AZ::ReflectContext* context);
+
+        static void GetProvidedServices(AZ::ComponentDescriptor::DependencyArrayType& provided);
+        static void GetIncompatibleServices(AZ::ComponentDescriptor::DependencyArrayType& incompatible);
+        static void GetRequiredServices(AZ::ComponentDescriptor::DependencyArrayType& required);
+        static void GetDependentServices(AZ::ComponentDescriptor::DependencyArrayType& dependent);
+
+        GaussianSplatSystemComponent() = default;
+        ~GaussianSplatSystemComponent() override = default;
+
+    protected:
+        ////////////////////////////////////////////////////////////////////////
+        // AZ::Component interface implementation
+        void Init() override;
+        void Activate() override;
+        void Deactivate() override;
+        ////////////////////////////////////////////////////////////////////////
+    private:
+        //! Registers this gem's pass template name -> .pass file mappings once the pass system is ready to load
+        //! them (Passes/GaussianSplatPassTemplates.azasset), following the same pattern DiffuseProbeGrid uses.
+        static void LoadPassTemplateMappings();
+
+        AZStd::unique_ptr<GaussianSplatAssetHandler> m_gaussianSplatAssetHandler;
+        AZ::RPI::PassSystemInterface::OnReadyLoadTemplatesEvent::Handler m_loadTemplatesHandler;
+    };
+
+} // namespace GaussianSplat

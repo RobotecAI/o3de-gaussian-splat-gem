@@ -1,0 +1,40 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatProjectCullGroupPassTemplate",
+            "PassClass": "GaussianSplatProjectCullGroupPass",
+            // SplatProjectionOut is connected from C++ - see GaussianSplatProjectCullGroupPass::BuildInternal.
+            "Slots": [
+                {
+                    "Name": "VisibleCounterOut",
+                    "SlotType": "Output",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "SplatProjectionOut",
+                    "SlotType": "Output",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "VisibleCounterOut",
+                    "AttachmentRef": {
+                        "Pass": "GaussianSplatVisibleCounterClear",
+                        "Attachment": "VisibleCounterOut"
+                    }
+                }
+            ],
+            "PassRequests": [
+                {
+                    "Name": "GaussianSplatVisibleCounterClear",
+                    "TemplateName": "GaussianSplatVisibleCounterClearPassTemplate",
+                    "Enabled": true
+                }
+            ]
+        }
+    }
+}

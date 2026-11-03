@@ -1,0 +1,91 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixPrepareSortDispatchPassTemplate",
+            "PassClass": "GaussianSplatRadixPrepareSortDispatchPass",
+            "Slots": [
+                {
+                    "Name": "EntryCounter",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_entryCounter",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "CountsOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_countsOut",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "BlockDispatchArgsOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_blockDispatchArgsOut",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "UnpackArgsOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_unpackArgsOut",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    // One DispatchIndirectCommand, the same size every frame. Bind flags are left to
+                    // PassAttachment::OnAttached, which infers ShaderWrite from this slot and Indirect
+                    // from the consuming pass's - "Indirect" cannot be named here, the reflected
+                    // BufferBindFlags enum has no such value.
+                    "Name": "BlockDispatchArgs",
+                    "Lifetime": "Transient",
+                    "BufferDescriptor": {
+                        "m_byteCount": "12"
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementCount": "3",
+                        "m_elementSize": "4"
+                    }
+                },
+                {
+                    "Name": "UnpackArgs",
+                    "Lifetime": "Transient",
+                    "BufferDescriptor": {
+                        "m_byteCount": "12"
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementCount": "3",
+                        "m_elementSize": "4"
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "BlockDispatchArgsOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "BlockDispatchArgs"
+                    }
+                },
+                {
+                    "LocalSlot": "UnpackArgsOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "UnpackArgs"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ThreadCountX": 1,
+                "ThreadCountY": 1,
+                "ThreadCountZ": 1,
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixPrepareSortDispatch.shader"
+                },
+                "FullscreenDispatch": false
+            }
+        }
+    }
+}

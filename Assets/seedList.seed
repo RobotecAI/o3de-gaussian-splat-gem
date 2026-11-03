@@ -1,0 +1,21 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "AZStd::vector<SeedInfo, allocator>",
+    "ClassData": [
+        {
+            "assetId": {
+                "guid": "{1E28DCCD-C17E-5B77-842A-FCFFFD0108B1}"
+            },
+            "platformFlags": 2,
+            "pathHint": "passes/gaussiansplatpasstemplates.azasset"
+        },
+        {
+            "assetId": {
+                "guid": "{9F4E77CE-9207-5584-8541-F563EBD5F44A}"
+            },
+            "platformFlags": 2,
+            "pathHint": "passes/gaussiansplatparentrequest.azasset"
+        }
+    ]
+}

@@ -1,0 +1,389 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include "GaussianSplatCommon.azsli"
+#include "GaussianSplatWaveOps.azsli"
+
+
+// One 8-bit LSD radix-sort digit round in a single kernel: local histogram, decoupled look-back scan and
+// stable scatter, over one read of the entries. Merrill & Garland's decoupled look-back (NVIDIA 2016) applied
+// to radix sort as in Adinets & Merrill's Onesweep - the scan is fused into the pass that produces its input
+// and consumes its output, so no per-block histogram or offset table ever reaches memory.
+//
+// One 256-thread group per RadixBlockSize block, indirectly dispatched, RadixKeysPerThread entries per thread.
+// The block is ranked into digit order in groupshared and only then written to m_entriesOut, keeping the
+// round's scattered traffic on-chip and every global write coalesced. See GaussianSplatRadixOnesweepPass for
+// the round's overall structure.
+//
+// Requires SM6.0 wave intrinsics with no fallback path (RHI::DeviceFeatures::m_waveOperation), guaranteed by
+// the .shader file's Vulkan 1.1 target.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<RadixEntry> m_entries;
+    StructuredBuffer<uint> m_counts; // [0] = entryCount (GaussianSplatRadixPrepareSortDispatch.azsl)
+    // [round][d] = digit d's exclusive prefix base for that round (the total count of every digit value below
+    // d, across every entry), precomputed once per frame for all rounds by the GaussianSplatRadixDigitBase pass.
+    StructuredBuffer<uint> m_digitBase;
+    RWStructuredBuffer<RadixEntry> m_entriesOut;
+    globallycoherent RWStructuredBuffer<uint> m_tileStatus;
+    RWStructuredBuffer<uint> m_tileCounter;
+
+    uint m_round;
+}
+
+// Status occupies the top 2 bits of an m_tileStatus word so a tile's status and value publish as one atomic
+// 32-bit write - readers can never observe one without the other. The low 30 bits hold the aggregate or
+// inclusive prefix value, covering any entry count this gem supports (GaussianSplatFeatureProcessor.cpp
+// clamps the configured entry capacity to MaxEntryCapacity, this same 30-bit bound).
+static const uint StatusNotReady = 0;
+static const uint StatusAggregate = 1;
+static const uint StatusPrefix = 2;
+static const uint StatusShift = 30;
+static const uint ValueMask = (1u << StatusShift) - 1;
+
+uint PackStatus(uint status, uint value)
+{
+    return (status << StatusShift) | (value & ValueMask);
+}
+
+// Max waves in a 256-thread group at a minimum subgroup size of 32. 
+#define MaxWavesPerGroup (NumDigits / 32)
+
+// The reorder window: the block is staged through groupshared StageCapacity entries at a time, in StageChunks
+// passes. All of it at once would need RadixBlockSize * 12 bytes, past the 32KB a group may allocate. The
+// trade is groupshared footprint against ALU - halving the window doubles how often each thread re-tests its
+// entries, doubling it cuts the occupancy that covers the look-back spin below. 1024 puts the kernel at ~13KB,
+// low enough that registers bound occupancy rather than groupshared.
+#define StageCapacity 1024
+#define StageChunks (RadixBlockSize / StageCapacity)
+#define StageRowsPerThread (StageCapacity / NumDigits)
+
+groupshared uint s_tileId;
+
+// Two disjoint lifetimes, in this order:
+//
+//  1. ranking and scan - [waveId * NumDigits + digit] holds wave `waveId`'s running count of `digit` entries,
+//     then that (wave, digit) pair's block-wide exclusive prefix. Only wave `waveId` touches row `waveId`, so
+//     ranking needs no cross-wave synchronisation. Wants MaxWavesPerGroup * NumDigits uints.
+//  2. reorder - the staging window, StageCapacity entries of three uints, holding one chunk in digit order.
+//     Wants StageCapacity * 3 uints, the larger of the two, so it sizes the array.
+//
+// Digit-major within a wave row rather than wave-major within a digit row, so the scan phase - where thread d
+// strides down column d - has all 256 threads on consecutive addresses. Wave-major spaces them 8 apart, which
+// maps 32 lanes onto 4 banks: an 8-way conflict per access.
+groupshared uint s_scratch[StageCapacity * 3];
+
+// Also two lifetimes, both keyed by digit: where digit d's entries start within the block, then the bias that
+// turns a block-local position carrying digit d into an m_entriesOut index.
+groupshared uint s_digitOffset[NumDigits];
+
+// Per-wave totals, the cross-wave half of the block-wide scan over s_digitOffset.
+groupshared uint s_waveTotals[MaxWavesPerGroup];
+
+// Packs a thread's RadixKeysPerThread in-block positions two per register. Positions are bounded by
+// RadixBlockSize, so 16 bits is ample, and the array stays live across the look-back spin below - exactly
+// where occupancy has to cover the stall. Requires RadixKeysPerThread to be even.
+static const uint RankPackShift = 16;
+static const uint RankPackMask = 0xFFFFu;
+
+[numthreads(NumDigits, 1, 1)]
+void MainCS(uint groupIndex : SV_GroupIndex)
+{
+    // Groups are not guaranteed to execute in order, so one could wait forever on a predecessor that has not launched. 
+    // A monotonic counter instead hands tile 0 to whichever group runs first (no predecessor, always completes), and by induction every tile
+    // waits only on a group already running or done. The id also selects this group's block of entries -
+    // fusing the scan into the scatter makes a group's chain position and its data the same thing.
+    if (groupIndex == 0)
+    {
+        InterlockedAdd(PassSrg::m_tileCounter[0], 1, s_tileId);
+    }
+
+    const uint laneCount = WaveGetLaneCount();
+    const uint waveCount = NumDigits / laneCount;
+    const uint waveId = groupIndex / laneCount;
+    const uint lane = WaveGetLaneIndex();
+    const uint waveRow = waveId * NumDigits;
+
+    // Each thread clears its own digit's column, together zeroing every slot the ranking below touches. Once
+    // per block: every later write either accumulates onto a slot or overwrites it outright.
+    for (uint clearWave = 0; clearWave < waveCount; ++clearWave)
+    {
+        s_scratch[clearWave * NumDigits + groupIndex] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint tile = s_tileId;
+    const uint entryCount = PassSrg::m_counts[0];
+    const uint digitShift = PassSrg::m_round * RadixDigitBits;
+    const uint blockBase = tile * RadixBlockSize;
+
+    // Entries this block actually owns; short only for the final block of the dispatch.
+    const uint blockCount = (blockBase < entryCount) ? min(entryCount - blockBase, (uint)RadixBlockSize) : 0u;
+
+    // Wave-blocked split: wave w owns the contiguous laneCount * RadixKeysPerThread entries starting here, and
+    // key step k covers the contiguous laneCount-entry run at waveBase + k * laneCount. An entry's in-block
+    // position is waveBase + k * laneCount + lane, ordering lexicographically by (waveId, k, lane).
+    //
+    // That order is what makes the ranking stable, and why the split is not 256 threads striped across each
+    // key step: per-wave running counts accumulate over key steps and combine across waves only at the end, so
+    // ranks come out in (waveId, k, lane) order and the data must match. Coalescing is unaffected - it is a
+    // per-wave property, and each wave still reads one contiguous run per step.
+    const uint waveBase = blockBase + waveId * (laneCount * RadixKeysPerThread);
+
+    // Every load is issued before any is consumed, so they overlap instead of serializing. Out-of-range lanes
+    // read entry 0 (never out of bounds) and are excluded from every mask and write below via `valid`, so they
+    // cannot influence a real entry's rank. The entries stay in registers through the look-back spin, which is
+    // what keeps this to a single read of m_entries.
+    RadixEntry entries[RadixKeysPerThread];
+    [unroll]
+    for (uint load = 0; load < RadixKeysPerThread; ++load)
+    {
+        const uint loadIndex = waveBase + load * laneCount + lane;
+        entries[load] = PassSrg::m_entries[loadIndex < entryCount ? loadIndex : 0u];
+    }
+
+    // Loop-invariant across key steps.
+    const uint4 lanesBelow = LanesBelowSelf();
+
+    // Rank within the wave, one key step at a time. packedPositions holds each entry's position among this
+    // wave's entries sharing its digit, across all key steps. The two remaining terms - the lower waves' share
+    // of the digit, and where the digit starts within the block - fold in once the scans below produce them.
+    //
+    // No barrier or fence anywhere in this loop. A wave's counts live in its own s_scratch row that no other
+    // wave touches, so there is no cross-wave race. Within the wave, every lane sharing a digit reads the
+    // running count in the same instruction that precedes the one lane's store, so all of them observe the
+    // pre-update value. Across key steps, `slot` is a dynamic index the compiler cannot prove distinct, so the
+    // read-after-write dependency already orders step k+1's load below step k's store.
+    uint packedPositions[RadixKeysPerThread / 2];
+    [unroll]
+    for (uint k = 0; k < RadixKeysPerThread; ++k)
+    {
+        const bool valid = waveBase + k * laneCount + lane < entryCount;
+        const uint digit = ExtractRadixDigit(entries[k].m_key, digitShift);
+
+        // Rank and count among only the valid lanes in this wave that share this lane's digit.
+        const uint4 matchMask = WaveMatchDigit(digit, valid);
+        const uint intraWaveRank = CountBits4(matchMask & lanesBelow);
+
+        const uint slot = waveRow + digit;
+        const uint runningBase = s_scratch[slot];
+
+        // Only the lowest matching lane advances this wave's running count for this digit, by the number of
+        // entries the wave places this step - one write per (wave, digit) pair per step.
+        if (valid && intraWaveRank == 0)
+        {
+            s_scratch[slot] = runningBase + CountBits4(matchMask);
+        }
+
+        // k is a literal after unrolling, so the half-select and the shift fold away.
+        const uint rank = runningBase + intraWaveRank;
+        if ((k & 1u) == 0u)
+        {
+            packedPositions[k >> 1] = rank;
+        }
+        else
+        {
+            packedPositions[k >> 1] |= rank << RankPackShift;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // From here `d` is a digit this thread owns on behalf of the whole block, not its own entries' digits.
+    // One thread per digit turns that digit's per-wave totals into block-wide exclusive prefixes, in place.
+    // waveCount is at most 8, so this is a handful of serial adds across all 256 threads at once.
+    //
+    // digitRunning ends as this block's total count of digit d: the local histogram row a separate pass would
+    // otherwise tally and write to memory, here free from the ranking the reorder needs anyway.
+    const uint d = groupIndex;
+    uint digitRunning = 0;
+    for (uint w = 0; w < waveCount; ++w)
+    {
+        const uint slot = w * NumDigits + d;
+        const uint count = s_scratch[slot];
+        s_scratch[slot] = digitRunning;
+        digitRunning += count;
+    }
+    const uint localCount = digitRunning;
+
+    // Exclusive scan of those 256 per-digit totals: where digit d's run starts within the reordered block. A
+    // wave prefix sum plus a walk over at most 8 wave totals, rather than a log2(NumDigits)-step groupshared
+    // scan.
+    const uint waveExclusive = WavePrefixSum(localCount);
+    if (lane == laneCount - 1)
+    {
+        s_waveTotals[waveId] = waveExclusive + localCount;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint waveCarry = 0;
+    for (uint priorWave = 0; priorWave < waveId; ++priorWave)
+    {
+        waveCarry += s_waveTotals[priorWave];
+    }
+    s_digitOffset[d] = waveCarry + waveExclusive;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Complete each entry's block-local destination, in place: where its digit's run starts, plus the lower
+    // waves' share of that run, plus its rank within this wave. Still bounded by RadixBlockSize, so it still
+    // fits a packed 16-bit half. Last read of s_scratch's ranking contents - the array is free to become the
+    // staging window after this.
+    //
+    // Entries past entryCount take RankPackMask instead of a position. Real positions are bounded by
+    // RadixBlockSize (4096), so the sentinel (65535) is unreachable and no chunk's window can contain it - the
+    // smallest windowSlot it yields is 62463, against a StageCapacity of 1024. That is what lets the reorder
+    // loop below skip this bounds check across all RadixKeysPerThread * StageChunks of its unrolled
+    // iterations. It has to be written here rather than before the fold, or `bias << shift` would carry out of
+    // the sentinel half into its neighbour.
+    [unroll]
+    for (uint fold = 0; fold < RadixKeysPerThread; ++fold)
+    {
+        const uint shift = (fold & 1u) * RankPackShift;
+        if (waveBase + fold * laneCount + lane < entryCount)
+        {
+            const uint digit = ExtractRadixDigit(entries[fold].m_key, digitShift);
+            const uint bias = s_digitOffset[digit] + s_scratch[waveRow + digit];
+            packedPositions[fold >> 1] += bias << shift;
+        }
+        else
+        {
+            packedPositions[fold >> 1] |= RankPackMask << shift;
+        }
+    }
+
+    // Ends both arrays' ranking lifetime before any thread can race ahead: a thread whose look-back returns
+    // immediately would otherwise overwrite s_digitOffset while slower threads still read it above.
+    GroupMemoryBarrierWithGroupSync();
+
+    // Tile 0 has no predecessor, so its exclusive prefix is 0 and it publishes StatusPrefix directly, skipping
+    // the aggregate publish, the fence and the walk. Publishing a prefix rather than an aggregate is also what
+    // bounds every other tile's walk: the chain terminates at tile 0 at the latest.
+    uint exclusive = 0;
+    if (tile != 0)
+    {
+        PassSrg::m_tileStatus[tile * NumDigits + d] = PackStatus(StatusAggregate, localCount);
+
+        // Orders this publish ahead of the look-back's loads. globallycoherent keeps those loads off a stale
+        // L1 but will not stop this store sinking below them, leaving successors spinning on it forever.
+        DeviceMemoryBarrier();
+
+        // Walk backward accumulating an exclusive prefix. StatusPrefix already encodes everything before it
+        // and ends that lane's walk; StatusAggregate carries only its own local count, so the walk continues
+        // past it; StatusNotReady means nothing is published yet - spin.
+        //
+        // The walk is wave-uniform: `t` is one value for the whole wave and advances only once every
+        // still-walking lane has a ready word. A wave's lanes cover consecutive `d`, so a step's loads are one
+        // contiguous run of words; advancing lanes independently drifts them onto different `t` within a few
+        // steps and turns that run into a gather, exactly when contention is highest. Finished lanes stop
+        // loading and let the rest of the wave carry the walk back.
+        bool done = false;
+        int t = int(tile) - 1;
+        while (t >= 0)
+        {
+            if (WaveActiveAllTrue(done))
+            {
+                break;
+            }
+
+            const uint word = done ? 0u : PassSrg::m_tileStatus[uint(t) * NumDigits + d];
+            const uint status = word >> StatusShift;
+
+            if (!WaveActiveAllTrue(done || status != StatusNotReady))
+            {
+                // Fence-only, taken by the whole wave: waves diverge from each other here, so a
+                // *WithGroupSync would deadlock on the ones that already left. It also forces the re-read -
+                // t is unchanged, so the load could otherwise be hoisted out of the spin.
+                DeviceMemoryBarrier();
+                continue;
+            }
+
+            if (!done)
+            {
+                exclusive += word & ValueMask;
+                done = (status == StatusPrefix);
+            }
+            --t;
+        }
+    }
+
+    // Publish this tile's inclusive prefix so later tiles stop their walk here instead of going further back.
+    // Only the intra-digit prefix travels the chain - the digit base is added once, on the way out, so a
+    // successor's look-back can never double-count it.
+    PassSrg::m_tileStatus[tile * NumDigits + d] = PackStatus(StatusPrefix, exclusive + localCount);
+
+    // Turn digit d's block-local start into the bias mapping any block-local position carrying digit d to its
+    // m_entriesOut index. Both terms are needed: the digit base alone would stack every block of a digit on
+    // top of each other, the look-back prefix alone would stack all 256 digits at offset 0.
+    //
+    // The subtraction underflows whenever a digit sits further into the block than into the output - common
+    // and harmless, since the reorder below only adds this back to a position inside digit d's run and the
+    // wraparound cancels in the same modular arithmetic it came from.
+    const uint blockOffset = PassSrg::m_digitBase[PassSrg::m_round * NumDigits + d] + exclusive;
+    s_digitOffset[d] = blockOffset - s_digitOffset[d];
+
+    // Reached by every thread despite the spin above: every predecessor eventually publishes, so every wave
+    // leaves the loop. Only a *WithGroupSync inside the loop would deadlock.
+    GroupMemoryBarrierWithGroupSync();
+
+    // Reorder the block into digit order through groupshared, one window at a time, writing each window out
+    // linearly. Writing straight from registers would put every lane of a wave in a different digit's run:
+    // ~32 separate memory sectors to move a wave's 384 bytes. Staged, consecutive threads write consecutive
+    // m_entriesOut elements and cross a run boundary only once per digit.
+    for (uint chunk = 0; chunk < StageChunks; ++chunk)
+    {
+        const uint chunkBase = chunk * StageCapacity;
+
+        // Deposit whichever of this thread's entries land in this window. Every thread re-tests all of its
+        // entries each chunk - a subtract and an unsigned compare, with predicated stores. Out-of-range
+        // entries need no test of their own: their RankPackMask sentinel falls outside every window.
+        [unroll]
+        for (uint stage = 0; stage < RadixKeysPerThread; ++stage)
+        {
+            const uint position = (packedPositions[stage >> 1] >> ((stage & 1u) * RankPackShift)) & RankPackMask;
+            const uint windowSlot = position - chunkBase;
+            if (windowSlot < StageCapacity)
+            {
+                const uint slotBase = windowSlot * 3;
+                s_scratch[slotBase + 0] = entries[stage].m_key.x;
+                s_scratch[slotBase + 1] = entries[stage].m_key.y;
+                s_scratch[slotBase + 2] = entries[stage].m_visibleSlot;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Drain the window in m_entriesOut order. The three-uint stride is coprime with the bank count, so
+        // these reads stay conflict-free, and s_digitOffset is a broadcast across a run's threads, not a
+        // gather.
+        for (uint row = 0; row < StageRowsPerThread; ++row)
+        {
+            const uint windowSlot = row * NumDigits + groupIndex;
+            const uint position = chunkBase + windowSlot;
+            if (position < blockCount)
+            {
+                const uint slotBase = windowSlot * 3;
+
+                RadixEntry entry;
+                entry.m_key = uint2(s_scratch[slotBase + 0], s_scratch[slotBase + 1]);
+                entry.m_visibleSlot = s_scratch[slotBase + 2];
+
+                const uint digit = ExtractRadixDigit(entry.m_key, digitShift);
+                PassSrg::m_entriesOut[position + s_digitOffset[digit]] = entry;
+            }
+        }
+
+        // Keeps the next window's deposits off slots this one has not finished draining.
+        GroupMemoryBarrierWithGroupSync();
+    }
+}

@@ -1,0 +1,61 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixPrepareBuildKeysDispatchPassTemplate",
+            "PassClass": "GaussianSplatRadixPrepareBuildKeysDispatchPass",
+            "Slots": [
+                {
+                    "Name": "VisibleCounter",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_visibleCounter",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "DispatchArgsOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_dispatchArgsOut",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    // One DispatchIndirectCommand, the same size every frame. Bind flags are left to
+                    // PassAttachment::OnAttached, which infers ShaderWrite from this slot and Indirect
+                    // from the consuming pass's - "Indirect" cannot be named here, the reflected
+                    // BufferBindFlags enum has no such value.
+                    "Name": "DispatchArgs",
+                    "Lifetime": "Transient",
+                    "BufferDescriptor": {
+                        "m_byteCount": "12"
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementCount": "3",
+                        "m_elementSize": "4"
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "DispatchArgsOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "DispatchArgs"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ThreadCountX": 1,
+                "ThreadCountY": 1,
+                "ThreadCountZ": 1,
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixPrepareBuildKeysDispatch.shader"
+                },
+                "FullscreenDispatch": false
+            }
+        }
+    }
+}

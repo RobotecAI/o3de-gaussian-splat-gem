@@ -1,0 +1,41 @@
+/* Copyright 2026, Robotec.ai sp. z o.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+
+// Single-thread pass: turns the GPU-only visible-splat counter into the DispatchIndirectCommand that
+// GaussianSplatRadixBuildKeysPass dispatches from, so it only launches thread groups covering the real
+// visible splat count instead of always dispatching over the m_totalSplatCount upper bound.
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    StructuredBuffer<uint> m_visibleCounter;
+    RWStructuredBuffer<uint> m_dispatchArgsOut;
+
+    uint m_totalSplatCount;
+}
+
+[numthreads(1, 1, 1)]
+void MainCS()
+{
+    // m_visibleCounter can itself exceed m_totalSplatCount (ProjectCull's InterlockedAdd runs before its own
+    // bounds check) - clamp here too, since an unclamped value would launch BuildKeys threads reading past
+    // ProjectCull's compacted output buffers.
+    const uint visibleCount = min(PassSrg::m_visibleCounter[0], PassSrg::m_totalSplatCount);
+    const uint groupCount = (visibleCount + 255) / 256;
+
+    PassSrg::m_dispatchArgsOut[0] = groupCount;
+    PassSrg::m_dispatchArgsOut[1] = 1;
+    PassSrg::m_dispatchArgsOut[2] = 1;
+}

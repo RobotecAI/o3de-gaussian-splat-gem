@@ -1,0 +1,84 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixOnesweepPassTemplate",
+            "PassClass": "GaussianSplatRadixOnesweepPass",
+            "Slots": [
+                {
+                    "Name": "Entries",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_entries",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "Counts",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_counts",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "DigitBase",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_digitBase",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "EntriesOut",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_entriesOut",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "TileStatus",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_tileStatus",
+                    "ScopeAttachmentUsage": "Shader",
+                    // Zeroed by the RHI before this round's dispatch, replacing a dedicated clear pass: the
+                    // decoupled look-back requires StatusNotReady / tile 0 at the start of every round.
+                    // Note: the RHI's Metal backend has no buffer-clear path.
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [0, 0, 0, 0]
+                        }
+                    }
+                },
+                {
+                    "Name": "TileCounter",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_tileCounter",
+                    "ScopeAttachmentUsage": "Shader",
+                    // Zeroed by the RHI before this round's dispatch, replacing a dedicated clear pass: the
+                    // decoupled look-back requires StatusNotReady / tile 0 at the start of every round.
+                    // Note: the RHI's Metal backend has no buffer-clear path.
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [0, 0, 0, 0]
+                        }
+                    }
+                },
+                {
+                    "Name": "IndirectArgs",
+                    "SlotType": "Input",
+                    "ShaderInputName": "NoBind",
+                    "ScopeAttachmentUsage": "Indirect"
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixOnesweep.shader"
+                },
+                "FullscreenDispatch": false,
+                "IndirectDispatch": true,
+                "IndirectDispatchBufferSlotName": "IndirectArgs"
+            }
+        }
+    }
+}

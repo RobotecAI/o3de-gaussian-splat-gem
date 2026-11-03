@@ -1,0 +1,80 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixGlobalHistogramPassTemplate",
+            "PassClass": "ComputePass",
+            "Slots": [
+                {
+                    "Name": "Entries",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_entries",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "Counts",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_counts",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "GlobalHistogramOut",
+                    "SlotType": "InputOutput",
+                    "ShaderInputName": "m_globalHistogramOut",
+                    "ScopeAttachmentUsage": "Shader",
+                    // The RHI zeroes the whole buffer view before the dispatch (Vulkan vkCmdFillBuffer,
+                    // DX12 ClearUnorderedAccessViewUint), so the shader's atomics start from an empty table.
+                    // Note: the RHI's Metal backend has no buffer-clear path.
+                    "LoadStoreAction": {
+                        "LoadAction": "Clear",
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [0, 0, 0, 0]
+                        }
+                    }
+                },
+                {
+                    "Name": "IndirectArgs",
+                    "SlotType": "Input",
+                    "ShaderInputName": "NoBind",
+                    "ScopeAttachmentUsage": "Indirect"
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    "Name": "GlobalHistogram",
+                    "BufferDescriptor": {
+                        "m_bindFlags": "ShaderReadWrite",
+                        "m_byteCount": "6144", // NumRadixRounds * NumDigits * sizeof(uint)
+                        "m_alignment": "4" // sizeof(uint)
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementOffset": "0",
+                        "m_elementCount": "1536", // NumRadixRounds * NumDigits
+                        "m_elementSize": "4" // sizeof(uint)
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "GlobalHistogramOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "GlobalHistogram"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixGlobalHistogram.shader"
+                },
+                "FullscreenDispatch": false,
+                "IndirectDispatch": true,
+                "IndirectDispatchBufferSlotName": "IndirectArgs"
+            }
+        }
+    }
+}

@@ -1,0 +1,64 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatVisibleCounterClearPassTemplate",
+            // Stock AZ::RPI::ComputePass: this pass owns the counter below and gives the RHI a scope to
+            // clear it in, nothing more.
+            "PassClass": "ComputePass",
+            "Slots": [
+                {
+                    // "Vector4Uint" is required: Vulkan bit-casts the first component into vkCmdFillBuffer.
+                    "Name": "VisibleCounterOut",
+                    "SlotType": "Output",
+                    "ScopeAttachmentUsage": "Shader",
+                    "ShaderInputName": "NoBind",
+                    "LoadStoreAction": {
+                        "ClearValue": {
+                            "Type": "Vector4Uint",
+                            "UintValue": [ 0, 0, 0, 0 ]
+                        },
+                        "LoadAction": "Clear"
+                    }
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    // Fixed size and single-frame, so it needs none of GaussianSplatFeatureProcessor's
+                    // capacity-driven allocation. Structured view, matching RWStructuredBuffer<uint>.
+                    "Name": "VisibleCounter",
+                    "Lifetime": "Transient",
+                    "BufferDescriptor": {
+                        "m_bindFlags": "ShaderReadWrite",
+                        "m_byteCount": "4"
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementCount": "1",
+                        "m_elementSize": "4"
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "VisibleCounterOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "VisibleCounter"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ThreadCountX": 1,
+                "ThreadCountY": 1,
+                "ThreadCountZ": 1,
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatVisibleCounterClear.shader"
+                },
+                "FullscreenDispatch": false
+            }
+        }
+    }
+}

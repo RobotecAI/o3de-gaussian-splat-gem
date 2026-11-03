@@ -1,0 +1,59 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "GaussianSplatRadixDigitBasePassTemplate",
+            "PassClass": "ComputePass",
+            "Slots": [
+                {
+                    "Name": "GlobalHistogram",
+                    "SlotType": "Input",
+                    "ShaderInputName": "m_globalHistogram",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "DigitBaseOut",
+                    "SlotType": "Output",
+                    "ShaderInputName": "m_digitBaseOut",
+                    "ScopeAttachmentUsage": "Shader"
+                }
+            ],
+            "BufferAttachments": [
+                {
+                    "Name": "DigitBase",
+                    "BufferDescriptor": {
+                        "m_bindFlags": "ShaderReadWrite",
+                        "m_byteCount": "6144", // NumRadixRounds * NumDigits * sizeof(uint)
+                        "m_alignment": "4" // sizeof(uint)
+                    },
+                    "BufferViewDescriptor": {
+                        "m_elementOffset": "0",
+                        "m_elementCount": "1536", // NumRadixRounds * NumDigits
+                        "m_elementSize": "4" // sizeof(uint)
+                    }
+                }
+            ],
+            "Connections": [
+                {
+                    "LocalSlot": "DigitBaseOut",
+                    "AttachmentRef": {
+                        "Pass": "This",
+                        "Attachment": "DigitBase"
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "ComputePassData",
+                "ThreadCountX": 1536, // NumRadixRounds * NumDigits
+                "ThreadCountY": 1,
+                "ThreadCountZ": 1,
+                "ShaderAsset": {
+                    "FilePath": "Shaders/GaussianSplats/GaussianSplatRadixDigitBase.shader"
+                },
+                "FullscreenDispatch": false
+            }
+        }
+    }
+}
