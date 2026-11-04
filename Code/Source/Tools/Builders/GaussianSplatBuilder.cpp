@@ -16,7 +16,6 @@
 #include "GaussianSplatBuilder.h"
 #include <AssetBuilderSDK/AssetBuilderSDK.h>
 #include <AssetBuilderSDK/SerializationDependencies.h>
-#include <AzCore/Outcome/Outcome.h>
 #include <AzCore/std/containers/vector.h>
 #include <AzCore/std/string/string.h>
 #include <GaussianSplat/GaussianSplatAsset.h>
@@ -45,19 +44,6 @@ namespace GaussianSplat
         {
             return std::string(FRestPrefix) + std::to_string(index);
         }
-
-        //! The .ply "vertex" properties ProcessJob reads, one entry per vertex in each vector.
-        struct PlyVertexProperties
-        {
-            uint32_t m_shDegree = 0;
-            size_t m_count = 0;
-            std::vector<float> m_posX, m_posY, m_posZ;
-            std::vector<float> m_opacity;
-            std::vector<float> m_scale0, m_scale1, m_scale2;
-            std::vector<float> m_rot0, m_rot1, m_rot2, m_rot3;
-            std::vector<float> m_shDc0, m_shDc1, m_shDc2;
-            std::vector<std::vector<float>> m_shRest;
-        };
 
         bool IsRestProperty(const std::string& propertyName)
         {
@@ -109,65 +95,6 @@ namespace GaussianSplat
                 {
                     return properties.contains(property);
                 });
-        }
-
-        //! Reads every vertex property a splat needs from the .ply at fullPath, with the SH degree implied by its
-        //! f_rest_* count. Fails with a description of the problem if the file is malformed or lacks any of
-        //! those properties.
-        AZ::Outcome<PlyVertexProperties, AZStd::string> ReadPlyVertexProperties(const char* fullPath)
-        {
-            std::ifstream file(fullPath, std::ios::binary);
-            if (!file.is_open())
-            {
-                return AZ::Failure(AZStd::string("the file cannot be opened"));
-            }
-
-            // happly does not check its reads: a short read leaves whatever it got in the property's values.
-            // Make a failed read throw instead, so a truncated file fails the job.
-            file.exceptions(std::ios::failbit | std::ios::badbit);
-
-            // happly reports other malformed input (bad header, missing "vertex" element, missing or uncoercible
-            // properties) by throwing.
-            try
-            {
-                happly::PLYData plyIn(file);
-                auto& vertexElement = plyIn.getElement("vertex");
-
-                const size_t restPropertyCount = std::ranges::count_if(vertexElement.getPropertyNames(), IsRestProperty);
-                const uint32_t shDegree = Math::ShDegreeFromRestCount(restPropertyCount);
-                const uint32_t restCount = Math::ShRestCoeffsPerSplat(shDegree);
-
-                PlyVertexProperties out;
-                out.m_shDegree = shDegree;
-                out.m_count = vertexElement.count;
-                out.m_posX = vertexElement.getProperty<float>("x");
-                out.m_posY = vertexElement.getProperty<float>("y");
-                out.m_posZ = vertexElement.getProperty<float>("z");
-                out.m_opacity = vertexElement.getProperty<float>("opacity");
-                out.m_scale0 = vertexElement.getProperty<float>("scale_0");
-                out.m_scale1 = vertexElement.getProperty<float>("scale_1");
-                out.m_scale2 = vertexElement.getProperty<float>("scale_2");
-                out.m_rot0 = vertexElement.getProperty<float>("rot_0");
-                out.m_rot1 = vertexElement.getProperty<float>("rot_1");
-                out.m_rot2 = vertexElement.getProperty<float>("rot_2");
-                out.m_rot3 = vertexElement.getProperty<float>("rot_3");
-                out.m_shDc0 = vertexElement.getProperty<float>("f_dc_0");
-                out.m_shDc1 = vertexElement.getProperty<float>("f_dc_1");
-                out.m_shDc2 = vertexElement.getProperty<float>("f_dc_2");
-                out.m_shRest.resize(restCount);
-                for (uint32_t i = 0; i < restCount; ++i)
-                {
-                    out.m_shRest[i] = vertexElement.getProperty<float>(FRestPropertyName(i));
-                }
-                return AZ::Success(AZStd::move(out));
-            } catch (const std::ios_base::failure&)
-            {
-                return AZ::Failure(
-                    AZStd::string(file.eof() ? "the file ends before all the data its header declares" : "the file cannot be read"));
-            } catch (const std::exception& e)
-            {
-                return AZ::Failure(AZStd::string(e.what()));
-            }
         }
     } // namespace
 
@@ -238,72 +165,101 @@ namespace GaussianSplat
     {
         response.m_resultCode = AssetBuilderSDK::ProcessJobResult_Failed;
 
-        const auto readOutcome = ReadPlyVertexProperties(request.m_fullPath.c_str());
-        if (!readOutcome.IsSuccess())
-        {
-            AZ_TracePrintf(
-                AssetBuilderSDK::ErrorWindow,
-                "Error: Failed to read %s: %s.\n",
-                request.m_fullPath.c_str(),
-                readOutcome.GetError().c_str());
-            return;
-        }
-        const PlyVertexProperties& ply = readOutcome.GetValue();
-        const uint32_t shDegree = ply.m_shDegree;
-        const size_t numVertices = ply.m_count;
-        const uint32_t restCoeffsPerChannel = Math::ShRestCoeffsPerChannel(shDegree);
-
         AZ::Data::Asset<GaussianSplatAsset> gaussianSplatAsset;
-        gaussianSplatAsset.Create(AZ::Data::AssetId(AZ::Uuid::CreateRandom()));
-        gaussianSplatAsset->m_shDegree = shDegree;
-        gaussianSplatAsset->m_data.resize(numVertices);
-        const uint32_t restCoeffsPerSplat = Math::ShRestCoeffsPerSplat(shDegree);
-        gaussianSplatAsset->m_shRest.resize(numVertices * restCoeffsPerSplat);
-
-        // Scratch for one splat's "rest" coefficients. The Y-up -> Z-up basis change mixes coefficients
-        // together, so it runs at full precision here and only the result is narrowed to binary16.
-        AZStd::vector<float> restScratch(restCoeffsPerSplat);
-
-        for (size_t i = 0; i < numVertices; ++i)
+        try
         {
-            GaussianSplatAsset::CloudVertex& vertex = gaussianSplatAsset->m_data[i];
-            const AZ::Vector3 position = Math::ConvertPositionYUpToZUp(ply.m_posX[i], ply.m_posY[i], ply.m_posZ[i]);
-            vertex.m_position = { position.GetX(), position.GetY(), position.GetZ() };
-
-            // .ply stores the rotation quaternion scalar-first (rot_0=w, rot_1=x, rot_2=y, rot_3=z), per the
-            // INRIA 3DGS training convention - ActivateRotation takes (x, y, z, w), so reorder accordingly.
-            const AZ::Quaternion rotation =
-                Math::ConvertRotationYUpToZUp(Math::ActivateRotation(ply.m_rot1[i], ply.m_rot2[i], ply.m_rot3[i], ply.m_rot0[i]));
-            vertex.m_rotation = { rotation.GetX(), rotation.GetY(), rotation.GetZ(), rotation.GetW() };
-
-            const AZ::Vector3 scale = Math::ConvertScaleYUpToZUp(
-                Math::ActivateScale(ply.m_scale0[i]), Math::ActivateScale(ply.m_scale1[i]), Math::ActivateScale(ply.m_scale2[i]));
-            vertex.m_scale = { scale.GetX(), scale.GetY(), scale.GetZ() };
-
-            vertex.m_opacity = Math::ActivateOpacity(ply.m_opacity[i]);
-
-            // The DC (degree-0) SH term is rotation-invariant, so the basis change leaves it alone.
-            vertex.m_shDc = { ply.m_shDc0[i], ply.m_shDc1[i], ply.m_shDc2[i] };
-
-            // f_rest_0..(3k-1) in the .ply is already channel-major (R block, then G block, then B block, each
-            // of length k) - the same convention GaussianSplatAsset::m_shRest uses, so this is a straight copy...
-            for (uint32_t j = 0; j < restCoeffsPerSplat; ++j)
+            std::ifstream file(request.m_fullPath.c_str(), std::ios::binary);
+            if (file.fail())
             {
-                restScratch[j] = ply.m_shRest[j][i];
+                throw std::runtime_error("PLY parser: Could not open file");
+            }
+            // happly does not check its reads: a short read leaves whatever it got in the property's values.
+            // Make a failed read throw instead, so a truncated file fails the job.
+            file.exceptions(std::ios::failbit | std::ios::badbit);
+
+            happly::PLYData plyIn(file);
+            auto& vertexElement = plyIn.getElement("vertex");
+            size_t numVertices = vertexElement.count;
+
+            const std::vector<float> posX = vertexElement.getProperty<float>("x");
+            const std::vector<float> posY = vertexElement.getProperty<float>("y");
+            const std::vector<float> posZ = vertexElement.getProperty<float>("z");
+            const std::vector<float> opacityRaw = vertexElement.getProperty<float>("opacity");
+            const std::vector<float> scale0 = vertexElement.getProperty<float>("scale_0");
+            const std::vector<float> scale1 = vertexElement.getProperty<float>("scale_1");
+            const std::vector<float> scale2 = vertexElement.getProperty<float>("scale_2");
+            const std::vector<float> rot0 = vertexElement.getProperty<float>("rot_0");
+            const std::vector<float> rot1 = vertexElement.getProperty<float>("rot_1");
+            const std::vector<float> rot2 = vertexElement.getProperty<float>("rot_2");
+            const std::vector<float> rot3 = vertexElement.getProperty<float>("rot_3");
+            const std::vector<float> shDc0 = vertexElement.getProperty<float>("f_dc_0");
+            const std::vector<float> shDc1 = vertexElement.getProperty<float>("f_dc_1");
+            const std::vector<float> shDc2 = vertexElement.getProperty<float>("f_dc_2");
+
+            const size_t restPropertyCount = std::ranges::count_if(vertexElement.getPropertyNames(), IsRestProperty);
+            const uint32_t shDegree = Math::ShDegreeFromRestCount(restPropertyCount);
+            std::vector<std::vector<float>> shRest(Math::ShRestCoeffsPerSplat(shDegree));
+            for (uint32_t i = 0; i < shRest.size(); ++i)
+            {
+                shRest[i] = vertexElement.getProperty<float>(FRestPropertyName(i));
             }
 
-            // ...but the coefficients themselves are still expressed in the .ply's frame, so apply the same
-            // Y-up -> Z-up basis change to each channel's block independently.
-            for (uint32_t channel = 0; channel < 3; ++channel)
-            {
-                Math::ConvertShRestYUpToZUp(shDegree, restScratch.data() + static_cast<size_t>(channel * restCoeffsPerChannel));
-            }
+            const uint32_t restCoeffsPerChannel = Math::ShRestCoeffsPerChannel(shDegree);
 
-            uint16_t* const splatRest = gaussianSplatAsset->m_shRest.data() + i * restCoeffsPerSplat;
-            for (uint32_t j = 0; j < restCoeffsPerSplat; ++j)
+            gaussianSplatAsset.Create(AZ::Data::AssetId(AZ::Uuid::CreateRandom()));
+            gaussianSplatAsset->m_shDegree = shDegree;
+            gaussianSplatAsset->m_data.resize(numVertices);
+            const uint32_t restCoeffsPerSplat = Math::ShRestCoeffsPerSplat(shDegree);
+            gaussianSplatAsset->m_shRest.resize(numVertices * restCoeffsPerSplat);
+
+            // Scratch for one splat's "rest" coefficients. The Y-up -> Z-up basis change mixes coefficients
+            // together, so it runs at full precision here and only the result is narrowed to binary16.
+            AZStd::vector<float> restScratch(restCoeffsPerSplat);
+
+            for (size_t i = 0; i < numVertices; ++i)
             {
-                splatRest[j] = Math::FloatToHalf(restScratch[j]);
+                GaussianSplatAsset::CloudVertex& vertex = gaussianSplatAsset->m_data[i];
+                const AZ::Vector3 position = Math::ConvertPositionYUpToZUp(posX[i], posY[i], posZ[i]);
+                vertex.m_position = { position.GetX(), position.GetY(), position.GetZ() };
+
+                // .ply stores the rotation quaternion scalar-first (rot_0=w, rot_1=x, rot_2=y, rot_3=z), per the
+                // INRIA 3DGS training convention - ActivateRotation takes (x, y, z, w), so reorder accordingly.
+                const AZ::Quaternion rotation = Math::ConvertRotationYUpToZUp(Math::ActivateRotation(rot1[i], rot2[i], rot3[i], rot0[i]));
+                vertex.m_rotation = { rotation.GetX(), rotation.GetY(), rotation.GetZ(), rotation.GetW() };
+
+                const AZ::Vector3 scale = Math::ConvertScaleYUpToZUp(
+                    Math::ActivateScale(scale0[i]), Math::ActivateScale(scale1[i]), Math::ActivateScale(scale2[i]));
+                vertex.m_scale = { scale.GetX(), scale.GetY(), scale.GetZ() };
+
+                vertex.m_opacity = Math::ActivateOpacity(opacityRaw[i]);
+
+                // The DC (degree-0) SH term is rotation-invariant, so the basis change leaves it alone.
+                vertex.m_shDc = { shDc0[i], shDc1[i], shDc2[i] };
+
+                // f_rest_0..(3k-1) in the .ply is already channel-major (R block, then G block, then B block, each
+                // of length k) - the same convention GaussianSplatAsset::m_shRest uses, so this is a straight copy...
+                for (uint32_t j = 0; j < restCoeffsPerSplat; ++j)
+                {
+                    restScratch[j] = shRest[j][i];
+                }
+
+                // ...but the coefficients themselves are still expressed in the .ply's frame, so apply the same
+                // Y-up -> Z-up basis change to each channel's block independently.
+                for (uint32_t channel = 0; channel < 3; ++channel)
+                {
+                    Math::ConvertShRestYUpToZUp(shDegree, restScratch.data() + static_cast<size_t>(channel * restCoeffsPerChannel));
+                }
+
+                uint16_t* const splatRest = gaussianSplatAsset->m_shRest.data() + i * restCoeffsPerSplat;
+                for (uint32_t j = 0; j < restCoeffsPerSplat; ++j)
+                {
+                    splatRest[j] = Math::FloatToHalf(restScratch[j]);
+                }
             }
+        } catch (const std::exception& e)
+        {
+            AZ_TracePrintf(AssetBuilderSDK::ErrorWindow, "Failed to read %s: %s.\n", request.m_fullPath.c_str(), e.what());
+            return;
         }
 
         if (auto* assetHandler = AZ::Data::AssetManager::Instance().GetHandler(azrtti_typeid<GaussianSplatAsset>()))
@@ -334,5 +290,4 @@ namespace GaussianSplat
         }
         response.m_resultCode = AssetBuilderSDK::ProcessJobResult_Failed;
     }
-
 } // namespace GaussianSplat
