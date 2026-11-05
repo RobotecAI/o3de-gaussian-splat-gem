@@ -17,11 +17,19 @@
 
 #include <AssetBuilderSDK/AssetBuilderBusses.h>
 #include <AssetBuilderSDK/AssetBuilderSDK.h>
+#include <AzCore/std/containers/array.h>
 #include <GaussianSplat/GaussianSplatTypeIds.h>
 
 namespace GaussianSplat
 {
     [[maybe_unused]] constexpr const char* GaussianSplatBuilderName = "GaussianSplatBuilder";
+
+    //! The "vertex" properties a .ply must have for the builder to create jobs for it. Every property but the
+    //! positions sets a 3DGS .ply apart from a plain point cloud. The f_rest_* properties are optional: how many
+    //! there are sets the SH degree.
+    inline constexpr AZStd::array<const char*, 14> RequiredSplatVertexProperties = {
+        "x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"
+    };
 
     class GaussianSplatBuilder : public AssetBuilderSDK::AssetBuilderCommandBus::Handler
     {
@@ -37,10 +45,5 @@ namespace GaussianSplat
         void ShutDown() override
         {
         }
-
-        //! True if the .ply's "vertex" element has 3DGS properties (opacity, scale_0..2, rot_0..3, f_dc_0..2);
-        //! outputs the implied SH degree. Reads only the header (cheap per CreateJobs call) to avoid claiming
-        //! plain point-cloud .ply files that Pointcloud's builder also watches. Public for testing.
-        static bool IsGaussianSplatPly(const char* fullPath, uint32_t& outShDegree);
     };
 } // namespace GaussianSplat

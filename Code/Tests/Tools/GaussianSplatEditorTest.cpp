@@ -13,100 +13,191 @@
  * limitations under the License.
  */
 
+#include <AzCore/IO/Path/Path.h>
 #include <AzCore/UnitTest/TestTypes.h>
 #include <AzTest/AzTest.h>
+#include <AzTest/Utils.h>
 #include <Tools/Builders/GaussianSplatBuilder.h>
 
-#include <cstdio>
-#include <fstream>
+#include <array>
+#include <string>
+#include <vector>
 
 namespace UnitTest
 {
-    class GaussianSplatBuilderTest : public LeakDetectionFixture
-    {
-    };
-
     namespace
     {
-        //! Writes a minimal ASCII .ply header (no vertex payload - IsGaussianSplatPly only reads up to
-        //! "end_header") either with the full set of 3DGS vertex properties (+ restCount f_rest_* properties),
-        //! or with a plain point-cloud-style position+color layout.
-        void WriteTestPlyHeader(const char* path, bool includeGaussianSplatProperties, uint32_t restCount)
+        //! Header of a binary little-endian .ply with one "vertex" element of vertexCount entries, each holding
+        //! the given float properties.
+        std::string PlyHeader(size_t vertexCount, const std::vector<std::string>& properties)
         {
-            std::ofstream file(path, std::ios::binary);
-            file << "ply\n";
-            file << "format ascii 1.0\n";
-            file << "element vertex 1\n";
-            file << "property float x\n";
-            file << "property float y\n";
-            file << "property float z\n";
-            if (includeGaussianSplatProperties)
+            std::string header = "ply\nformat binary_little_endian 1.0\nelement vertex " + std::to_string(vertexCount) + "\n";
+            for (const std::string& property : properties)
             {
-                file << "property float opacity\n";
-                file << "property float scale_0\n";
-                file << "property float scale_1\n";
-                file << "property float scale_2\n";
-                file << "property float rot_0\n";
-                file << "property float rot_1\n";
-                file << "property float rot_2\n";
-                file << "property float rot_3\n";
-                file << "property float f_dc_0\n";
-                file << "property float f_dc_1\n";
-                file << "property float f_dc_2\n";
-                for (uint32_t i = 0; i < restCount; ++i)
+                header += "property float " + property + "\n";
+            }
+            return header + "end_header\n";
+        }
+
+        //! Binary .ply data of floatCount float zeros.
+        std::string ZeroFloats(size_t floatCount)
+        {
+            return std::string(floatCount * sizeof(float), '\0');
+        }
+
+        //! The vertex properties CreateJobs requires, and f_rest_0..(restCount-1).
+        std::vector<std::string> GaussianSplatProperties(uint32_t restCount)
+        {
+            std::vector<std::string> properties(
+                GaussianSplat::RequiredSplatVertexProperties.begin(), GaussianSplat::RequiredSplatVertexProperties.end());
+            for (uint32_t i = 0; i < restCount; ++i)
+            {
+                properties.push_back("f_rest_" + std::to_string(i));
+            }
+            return properties;
+        }
+
+        //! The vertex properties CreateJobs requires, except the positions x/y/z.
+        std::vector<std::string> GaussianSplatPropertiesWithoutPositions()
+        {
+            std::vector<std::string> properties = GaussianSplatProperties(0);
+            std::erase_if(
+                properties,
+                [](const std::string& property)
                 {
-                    file << "property float f_rest_" << i << "\n";
-                }
-            }
-            else
+                    return property == "x" || property == "y" || property == "z";
+                });
+            return properties;
+        }
+
+        //! Platforms enabled in every CreateJobs request the tests send.
+        constexpr std::array<const char*, 2> TestPlatforms = { "pc", "linux" };
+
+        //! Runs CreateJobs on the given .ply with TestPlatforms enabled.
+        AssetBuilderSDK::CreateJobsResponse RunCreateJobs(const AZ::IO::Path& path)
+        {
+            GaussianSplat::GaussianSplatBuilder builder;
+            AssetBuilderSDK::CreateJobsRequest request;
+            request.m_watchFolder = path.ParentPath().Native();
+            request.m_sourceFile = path.Filename().Native();
+            for (const char* platform : TestPlatforms)
             {
-                file << "property uchar red\n";
-                file << "property uchar green\n";
-                file << "property uchar blue\n";
+                request.m_enabledPlatforms.emplace_back(platform, AZStd::unordered_set<AZStd::string>{});
             }
-            file << "end_header\n";
+            AssetBuilderSDK::CreateJobsResponse response;
+            builder.CreateJobs(request, response);
+            return response;
+        }
+
+        //! Runs ProcessJob on the given .ply. Expects it not to throw - an exception escaping ProcessJob
+        //! terminates the AssetBuilder process.
+        AssetBuilderSDK::ProcessJobResultCode RunProcessJob(const char* path)
+        {
+            GaussianSplat::GaussianSplatBuilder builder;
+            AssetBuilderSDK::ProcessJobRequest request;
+            request.m_fullPath = path;
+            AssetBuilderSDK::ProcessJobResponse response;
+            response.m_resultCode = AssetBuilderSDK::ProcessJobResult_Success;
+            EXPECT_NO_THROW(builder.ProcessJob(request, response));
+            return response.m_resultCode;
         }
     } // namespace
 
-    TEST_F(GaussianSplatBuilderTest, RecognizesGaussianSplatPlyAndDetectsMaxShDegree)
+    class GaussianSplatBuilderTest : public LeakDetectionFixture
     {
-        const char* path = "test_gaussian_splat_degree3.ply";
-        WriteTestPlyHeader(path, true, 45);
+    protected:
+        //! Unique per test, so test .ply files never land in the working directory; removed with its contents
+        //! when the test ends.
+        AZ::Test::ScopedAutoTempDirectory m_tempDirectory;
 
-        uint32_t shDegree = 0;
-        EXPECT_TRUE(GaussianSplat::GaussianSplatBuilder::IsGaussianSplatPly(path, shDegree));
-        EXPECT_EQ(shDegree, 3u);
+        //! Writes contents to fileName in m_tempDirectory and returns its path. Fails the test if the file cannot be
+        //! written, since a missing file would also make ProcessJob fail.
+        AZ::IO::Path WriteFile(const char* fileName, const std::string& contents)
+        {
+            EXPECT_TRUE(
+                AZ::Test::CreateTestFile(m_tempDirectory, fileName, AZStd::string_view(contents.data(), contents.size())).has_value())
+                << "cannot write " << fileName;
+            return m_tempDirectory.Resolve(fileName);
+        }
 
-        std::remove(path);
+        //! Writes a complete binary .ply with a single vertex holding exactly the given float properties, so tests
+        //! can produce both valid splat files and ones that pass CreateJobs' header check but lack properties
+        //! ProcessJob reads.
+        AZ::IO::Path WriteTestPly(const char* fileName, const std::vector<std::string>& properties)
+        {
+            return WriteFile(fileName, PlyHeader(1, properties) + ZeroFloats(properties.size()));
+        }
+    };
+
+    TEST_F(GaussianSplatBuilderTest, CreatesJobPerPlatformForGaussianSplatPly)
+    {
+        const AZ::IO::Path path = WriteTestPly("test_gaussian_splat.ply", GaussianSplatProperties(45));
+
+        const AssetBuilderSDK::CreateJobsResponse response = RunCreateJobs(path);
+        EXPECT_EQ(response.m_result, AssetBuilderSDK::CreateJobsResultCode::Success);
+        ASSERT_EQ(response.m_createJobOutputs.size(), TestPlatforms.size());
+        for (size_t i = 0; i < TestPlatforms.size(); ++i)
+        {
+            EXPECT_EQ(response.m_createJobOutputs[i].GetPlatformIdentifier(), TestPlatforms[i]);
+        }
     }
 
-    TEST_F(GaussianSplatBuilderTest, RecognizesLowerShDegree)
+    TEST_F(GaussianSplatBuilderTest, CreatesNoJobsForPlainPointCloudPly)
     {
-        const char* path = "test_gaussian_splat_degree1.ply";
-        WriteTestPlyHeader(path, true, 9);
+        const AZ::IO::Path path = WriteTestPly("test_plain_pointcloud.ply", { "x", "y", "z", "red", "green", "blue" });
 
-        uint32_t shDegree = 0;
-        EXPECT_TRUE(GaussianSplat::GaussianSplatBuilder::IsGaussianSplatPly(path, shDegree));
-        EXPECT_EQ(shDegree, 1u);
-
-        std::remove(path);
+        const AssetBuilderSDK::CreateJobsResponse response = RunCreateJobs(path);
+        EXPECT_EQ(response.m_result, AssetBuilderSDK::CreateJobsResultCode::Success);
+        EXPECT_TRUE(response.m_createJobOutputs.empty());
     }
 
-    TEST_F(GaussianSplatBuilderTest, RejectsPlainPointCloudPly)
+    TEST_F(GaussianSplatBuilderTest, CreatesNoJobsForMissingFile)
     {
-        const char* path = "test_plain_pointcloud.ply";
-        WriteTestPlyHeader(path, false, 0);
+        const AZ::IO::Path path = m_tempDirectory.Resolve("this_file_does_not_exist.ply");
 
-        uint32_t shDegree = 0;
-        EXPECT_FALSE(GaussianSplat::GaussianSplatBuilder::IsGaussianSplatPly(path, shDegree));
-
-        std::remove(path);
+        const AssetBuilderSDK::CreateJobsResponse response = RunCreateJobs(path);
+        EXPECT_EQ(response.m_result, AssetBuilderSDK::CreateJobsResultCode::Success);
+        EXPECT_TRUE(response.m_createJobOutputs.empty());
     }
 
-    TEST_F(GaussianSplatBuilderTest, RejectsMissingFile)
+    TEST_F(GaussianSplatBuilderTest, CreatesNoJobsForPlyMissingPositions)
     {
-        uint32_t shDegree = 0;
-        EXPECT_FALSE(GaussianSplat::GaussianSplatBuilder::IsGaussianSplatPly("this_file_does_not_exist.ply", shDegree));
+        const AZ::IO::Path path = WriteTestPly("test_gaussian_splat_missing_xyz.ply", GaussianSplatPropertiesWithoutPositions());
+
+        const AssetBuilderSDK::CreateJobsResponse response = RunCreateJobs(path);
+        EXPECT_EQ(response.m_result, AssetBuilderSDK::CreateJobsResultCode::Success);
+        EXPECT_TRUE(response.m_createJobOutputs.empty());
     }
+
+    TEST_F(GaussianSplatBuilderTest, ProcessJobFailsOnPlyWithGapInFRest)
+    {
+        // Nine f_rest_* properties imply SH degree 1, but f_rest_8 is replaced by f_rest_9.
+        std::vector<std::string> properties = GaussianSplatProperties(8);
+        properties.emplace_back("f_rest_9");
+        const AZ::IO::Path path = WriteTestPly("test_gaussian_splat_f_rest_gap.ply", properties);
+
+        EXPECT_EQ(RunProcessJob(path.c_str()), AssetBuilderSDK::ProcessJobResult_Failed);
+    }
+
+    TEST_F(GaussianSplatBuilderTest, ProcessJobFailsOnNonPlyFile)
+    {
+        // happly rejects the first line by throwing from the PLYData constructor.
+        const AZ::IO::Path path = WriteFile("test_not_a_ply.ply", "not a ply file\n");
+
+        EXPECT_EQ(RunProcessJob(path.c_str()), AssetBuilderSDK::ProcessJobResult_Failed);
+    }
+
+    TEST_F(GaussianSplatBuilderTest, ProcessJobFailsOnTruncatedBinaryPly)
+    {
+        // The header declares two vertices but the data stops partway through the second; happly alone keeps
+        // the short read's values.
+        const std::vector<std::string> properties = GaussianSplatProperties(0);
+        const AZ::IO::Path path = WriteFile(
+            "test_gaussian_splat_truncated_binary.ply",
+            PlyHeader(2, properties) + ZeroFloats(properties.size() * 3 / 2));
+
+        EXPECT_EQ(RunProcessJob(path.c_str()), AssetBuilderSDK::ProcessJobResult_Failed);
+    }
+
     AZ_UNIT_TEST_HOOK(DEFAULT_UNIT_TEST_ENV);
 } // namespace UnitTest
