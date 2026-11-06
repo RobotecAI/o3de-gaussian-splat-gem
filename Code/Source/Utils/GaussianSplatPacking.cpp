@@ -19,8 +19,9 @@
 
 namespace GaussianSplat::Packing
 {
-    AZStd::vector<float> PackCloudGeometry(const AZStd::vector<GaussianSplatAsset::CloudVertex>& splatVertices, uint32_t splatCount)
+    AZStd::vector<float> PackCloudGeometry(const AZStd::vector<GaussianSplatAsset::CloudVertex>& splatVertices)
     {
+        const auto splatCount = static_cast<uint32_t>(splatVertices.size());
         AZStd::vector<float> packed(static_cast<size_t>(splatCount) * GeometryFloatsPerSplat, 0.0f);
         for (uint32_t splat = 0; splat < splatCount; ++splat)
         {
@@ -60,8 +61,9 @@ namespace GaussianSplat::Packing
         word = (word & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift);
     }
 
-    AZStd::vector<uint32_t> PackCloudSh(const GaussianSplatAsset& asset, uint32_t splatCount, uint32_t uploadDegree)
+    AZStd::vector<uint32_t> PackCloudSh(const GaussianSplatAsset& asset, uint32_t uploadDegree)
     {
+        const auto splatCount = static_cast<uint32_t>(asset.m_data.size());
         const uint32_t uploadCoeffs = Math::ShRestCoeffsPerChannel(uploadDegree);
         const uint32_t assetCoeffs = Math::ShRestCoeffsPerChannel(asset.m_shDegree);
         const uint32_t uintsPerSplat = ShUintsPerSplat(uploadDegree);
@@ -69,7 +71,8 @@ namespace GaussianSplat::Packing
         // Every coefficient is one binary16, two to a uint - see GaussianSplatProjectCull.azsl's ShHalf. The
         // per-splat run is padded up to a whole uint so a splat's coefficients always start on a uint
         // boundary, which is what lets the shader address them as splatIndex * m_shUintsPerSplat.
-        AZStd::vector<uint32_t> packed(static_cast<size_t>(splatCount) * uintsPerSplat, 0u);
+        uint64_t packedSize = uint64_t{ splatCount } * uintsPerSplat;
+        AZStd::vector<uint32_t> packed(packedSize, 0u);
         for (uint32_t splat = 0; splat < splatCount; ++splat)
         {
             const auto& vertex = asset.m_data[splat];

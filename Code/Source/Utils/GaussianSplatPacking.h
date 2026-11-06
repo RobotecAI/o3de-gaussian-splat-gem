@@ -31,10 +31,9 @@ namespace GaussianSplat::Packing
     //! Byte stride of one packed SplatGeometry element, and so the geometry buffer's element size.
     inline constexpr uint32_t GeometryElementSize = sizeof(float) * GeometryFloatsPerSplat;
 
-    //! Deinterleaves the first splatCount entries of splatVertices into the geometry buffer the splat shaders
-    //! read: GeometryFloatsPerSplat floats per splat, in SplatGeometry's field order, with the trailing pad
-    //! left at zero.
-    AZStd::vector<float> PackCloudGeometry(const AZStd::vector<GaussianSplatAsset::CloudVertex>& splatVertices, uint32_t splatCount);
+    //! Deinterleaves splatVertices into the geometry buffer the splat shaders read: GeometryFloatsPerSplat
+    //! floats per splat, in SplatGeometry's field order, with the trailing pad left at zero.
+    AZStd::vector<float> PackCloudGeometry(const AZStd::vector<GaussianSplatAsset::CloudVertex>& splatVertices);
 
     //! binary16 values in one splat's SH run at this degree: an (R, G, B) triple for the DC term plus one
     //! per "rest" coefficient per channel. Matches GaussianSplatProjectCull.azsl's ShElement addressing.
@@ -48,7 +47,7 @@ namespace GaussianSplat::Packing
     //! layout GaussianSplatProjectCull.azsl's ShHalf reads back.
     void WriteShHalf(uint32_t* splatRun, uint32_t halfIndex, uint16_t value);
 
-    //! Packs the first splatCount splats of asset into the SH buffer the cull shader reads: ShUintsPerSplat
+    //! Packs every splat of asset into the SH buffer the cull shader reads: ShUintsPerSplat
     //! (uploadDegree) uints per splat, holding the DC triple followed by the "rest" coefficients transposed
     //! from the asset's channel-major blocks into coefficient-major, RGB-interleaved order.
     //!
@@ -59,5 +58,5 @@ namespace GaussianSplat::Packing
     //!
     //! The coefficients are already binary16 in the asset, so this moves them without converting; only the
     //! DC term (full precision in CloudVertex::m_shDc) is narrowed here.
-    AZStd::vector<uint32_t> PackCloudSh(const GaussianSplatAsset& asset, uint32_t splatCount, uint32_t uploadDegree);
+    AZStd::vector<uint32_t> PackCloudSh(const GaussianSplatAsset& asset, uint32_t uploadDegree);
 } // namespace GaussianSplat::Packing

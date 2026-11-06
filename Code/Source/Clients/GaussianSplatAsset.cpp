@@ -164,7 +164,18 @@ namespace GaussianSplat
         stream->Read(sizeof(header), &header);
         AZ_Assert(
             header.m_magicNumber == GaussianSplatAsset::GaussianSplatMagicNumber, "Invalid magic number in gaussian splat asset file.");
-        AZ_Assert(header.m_shDegree <= GaussianSplatAsset::MaxShDegree, "Invalid SH degree in gaussian splat asset file.");
+        if (header.m_shDegree > GaussianSplatAsset::MaxShDegree)
+        {
+            // Everything downstream sizes per-degree tables by MaxShDegree, so a larger degree would index
+            // past them; refuse the file rather than load it.
+            AZ_Error(
+                "GaussianSplat",
+                false,
+                "Gaussian splat asset has SH degree %u, but at most %u is supported.",
+                header.m_shDegree,
+                GaussianSplatAsset::MaxShDegree);
+            return AZ::Data::AssetHandler::LoadResult::Error;
+        }
 
         const uint32_t restCoeffsStored = Math::ShRestCoeffsPerSplat(header.m_shDegree);
         const size_t elementSize = DiskElementSize(header.m_shDegree);
@@ -185,6 +196,7 @@ namespace GaussianSplat
         AZ_Info("GaussianSplat", "Loading gaussian splat cloud with %u points, SH degree %u", header.m_numPoints, header.m_shDegree);
 
         assetData->m_shDegree = header.m_shDegree;
+        assetData->m_bounds = AZ::Aabb::CreateNull();
         assetData->m_data.resize(header.m_numPoints);
         assetData->m_shRest.resize(static_cast<size_t>(header.m_numPoints) * restCoeffsStored);
 
@@ -193,6 +205,8 @@ namespace GaussianSplat
         {
             stream->Read(elementSize, vertexBuffer.data());
             UnpackVertex(assetData->m_data[i], assetData->m_shRest.data() + i * restCoeffsStored, restCoeffsStored, vertexBuffer.data());
+            const auto& position = assetData->m_data[i].m_position;
+            assetData->m_bounds.AddPoint(AZ::Vector3(position[0], position[1], position[2]));
         }
         return AZ::Data::AssetHandler::LoadResult::LoadComplete;
     }

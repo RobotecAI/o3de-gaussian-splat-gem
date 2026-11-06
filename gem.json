@@ -1,6 +1,6 @@
 {
     "gem_name": "GaussianSplat",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "display_name": "Gaussian Splat Gem",
     "license": "Apache-2.0",
     "license_url": "https://github.com/RobotecAI/o3de-gaussian-splat-gem/blob/HEAD/LICENSE.txt",
